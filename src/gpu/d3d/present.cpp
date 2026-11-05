@@ -180,7 +180,16 @@ bool PresentFrame(const std::shared_ptr<host::FramePresent>& present) {
   return dispatcher && dispatcher->Post([present, n](Engine& engine, std::string& out) {
     std::vector<uint8_t> bgra;
     uint32_t w = 0, h = 0;
-    const bool capture = n <= PresentCaptures() || present->capture;
+    bool capture = n <= PresentCaptures() || present->capture;
+#if defined(__ANDROID__)
+    // Development host: sample the real swapchain without enabling the older
+    // START instrumentation, which intentionally stops normal game boot.
+    static const uint64_t capture_period = [] {
+      const char* value = std::getenv("REX_ANDROID_PRESENT_CAPTURE_PERIOD");
+      return value ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    capture |= capture_period && n % capture_period == 0;
+#endif
     bool presented = false;
     const bool ok = engine.Present(present->slot, capture, bgra, w, h, out, &presented);
     ui::UiLayer().NotifyPresented(ok, presented);

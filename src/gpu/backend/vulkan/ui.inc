@@ -46,7 +46,7 @@ bool Backend::State::EnsureUiLayer(std::string& evidence) {
   const auto vs = PassShader("ui_vs", ShaderStage::kVertex), ps = PassShader("ui_ps", ShaderStage::kPixel);
   if (!vs.Present() || !ps.Present()) return GraphicsError(evidence, "native-ui-shader-module");
   auto pipeline = std::make_shared<GraphicsPipeline>(); pipeline->device = vulkan->vk;
-  if ((result = MakeRenderPass(vulkan->vk, VK_FORMAT_B8G8R8A8_UNORM, false, 1, pipeline->pass)) != VK_SUCCESS)
+  if ((result = MakeRenderPass(vulkan->vk, swap_format, false, 1, pipeline->pass)) != VK_SUCCESS)
     return GraphicsError(evidence, "native-ui-render-pass", result);
   VkShaderModule modules[2]{};
   VkPipelineShaderStageCreateInfo stages[2]{};
@@ -176,7 +176,7 @@ bool Backend::State::DrawUi(BackImage& back, std::string& evidence) {
   auto* p = static_cast<GraphicsPipeline*>(ui_pipeline.get());
   const uint32_t width = swap_extent.width, height = swap_extent.height;
   VkImageView target{};
-  if ((result = objects->View(back.image, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, 1, false,
+  if ((result = objects->View(back.image, swap_format, VK_IMAGE_ASPECT_COLOR_BIT, 1, false,
                               kIdentityMapping, target)) != VK_SUCCESS ||
       (result = objects->Framebuffer(p->pass, {target}, width, height)) != VK_SUCCESS)
     return GraphicsError(evidence, "native-ui-framebuffer", result);

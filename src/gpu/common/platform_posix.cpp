@@ -13,6 +13,9 @@
 #include <SDL3/SDL.h>
 #include <fmt/format.h>
 #include <rex/memory/utils.h>
+#if defined(__ANDROID__)
+#include <android/native_window.h>
+#endif
 
 namespace gpu::platform {
 int64_t Ticks() {
@@ -66,6 +69,10 @@ NativeWindow WindowHandles(void* native_handle) {
   if (!sdl) return window;
   window.handle = native_handle;
   const SDL_PropertiesID props = SDL_GetWindowProperties(sdl);
+#if defined(__ANDROID__)
+  window.kind = NativeWindow::Kind::kAndroid;
+  window.window = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
+#else
   if (void* display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr)) {
     window.kind = NativeWindow::Kind::kWayland;
     window.display = display;
@@ -75,10 +82,20 @@ NativeWindow WindowHandles(void* native_handle) {
     window.display = display;
     window.window = reinterpret_cast<void*>(uintptr_t(SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0)));
   }
+#endif
   if (!window.window) window = NativeWindow{};
   return window;
 }
 bool ClientSize(const NativeWindow& window, uint32_t& width, uint32_t& height) {
+#if defined(__ANDROID__)
+  if (window.kind == NativeWindow::Kind::kAndroid && !window.handle && window.window) {
+    // A Java Surface bridge retains the ANativeWindow until backend shutdown.
+    auto* native = static_cast<ANativeWindow*>(window.window);
+    const int w = ANativeWindow_getWidth(native), h = ANativeWindow_getHeight(native);
+    if (w <= 0 || h <= 0) return false;
+    width = uint32_t(w); height = uint32_t(h); return true;
+  }
+#endif
   auto* sdl = static_cast<SDL_Window*>(window.handle);
   int w = 0, h = 0;
   if (!sdl || (SDL_GetWindowFlags(sdl) & SDL_WINDOW_MINIMIZED) || !SDL_GetWindowSizeInPixels(sdl, &w, &h) || w <= 0 ||

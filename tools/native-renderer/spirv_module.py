@@ -14,7 +14,7 @@ import struct
 MAGIC = 0x07230203
 
 CAPABILITIES = {
-    0: 'Matrix', 1: 'Shader', 9: 'Float16', 10: 'Float64', 11: 'Int64', 22: 'Int16', 25: 'ImageGatherExtended',
+    0: 'Matrix', 1: 'Shader', 2: 'Geometry', 9: 'Float16', 10: 'Float64', 11: 'Int64', 22: 'Int16', 25: 'ImageGatherExtended',
     27: 'StorageImageMultisample', 28: 'UniformBufferArrayDynamicIndexing',
     29: 'SampledImageArrayDynamicIndexing', 30: 'StorageBufferArrayDynamicIndexing',
     31: 'StorageImageArrayDynamicIndexing', 32: 'ClipDistance', 33: 'CullDistance', 34: 'ImageCubeArray',
@@ -23,7 +23,7 @@ CAPABILITIES = {
     52: 'InterpolationFunction', 55: 'StorageImageReadWithoutFormat', 56: 'StorageImageWriteWithoutFormat',
     5301: 'ShaderNonUniform', 5302: 'RuntimeDescriptorArray', 5306: 'SampledImageArrayNonUniformIndexing',
     5347: 'PhysicalStorageBufferAddresses'}
-EXECUTION_MODELS = {0: 'vertex', 4: 'fragment', 5: 'compute'}
+EXECUTION_MODELS = {0: 'vertex', 3: 'geometry', 4: 'fragment', 5: 'compute'}
 STORAGE_CLASSES = {0: 'uniform-constant', 1: 'input', 2: 'uniform', 3: 'output', 9: 'push-constant',
                    12: 'storage-buffer', 5349: 'physical-storage-buffer'}
 BUILTINS = {0: 'Position', 1: 'PointSize', 3: 'ClipDistance', 4: 'CullDistance', 15: 'FragCoord', 17: 'FrontFacing',
@@ -33,7 +33,7 @@ DIMENSIONS = {0: '1D', 1: '2D', 2: '3D', 3: 'Cube', 4: 'Rect', 5: 'Buffer', 6: '
 IMAGE_FORMATS = {0: 'Unknown', 1: 'Rgba32f', 2: 'Rgba16f', 3: 'R32f', 4: 'Rgba8', 10: 'Rgba16', 11: 'Rgb10A2'}
 
 # Opcodes and decorations read here.
-OP_EXTENSION, OP_ENTRY_POINT, OP_CAPABILITY = 10, 15, 17
+OP_EXTENSION, OP_ENTRY_POINT, OP_EXECUTION_MODE, OP_CAPABILITY = 10, 15, 16, 17
 OP_TYPE_BOOL, OP_TYPE_INT, OP_TYPE_FLOAT, OP_TYPE_VECTOR, OP_TYPE_MATRIX = 20, 21, 22, 23, 24
 OP_TYPE_IMAGE, OP_TYPE_SAMPLER, OP_TYPE_SAMPLED_IMAGE, OP_TYPE_ARRAY, OP_TYPE_RUNTIME_ARRAY = 25, 26, 27, 28, 29
 OP_TYPE_STRUCT, OP_TYPE_POINTER, OP_CONSTANT = 30, 32, 43
@@ -63,6 +63,7 @@ def parse(data: bytes) -> dict:
     if words[0] != MAGIC:
         raise ValueError('spirv-magic')
     capabilities, extensions, entry_points = [], [], []
+    execution_modes = []
     types, constants, decorations, member_offsets, variables, spec = {}, {}, {}, {}, [], {}
     i = 5
     while i < len(words):
@@ -79,6 +80,8 @@ def parse(data: bytes) -> dict:
             name_words = _string_words(op[2:])
             entry_points.append(dict(model=EXECUTION_MODELS.get(op[0], op[0]), name=_string(op[2:]),
                                      interface=list(op[2 + name_words:])))
+        elif opcode == OP_EXECUTION_MODE:
+            execution_modes.append(dict(mode=op[1], arguments=list(op[2:])))
         elif opcode == OP_TYPE_BOOL:
             types[op[0]] = ('bool',)
         elif opcode == OP_TYPE_INT:
@@ -190,7 +193,7 @@ def parse(data: bytes) -> dict:
             push_constant_offset = first if push_constant_offset is None else min(push_constant_offset, first)
     key = lambda e: (e.get('location', -1), str(e.get('builtin', '')))
     return dict(version=f'{(words[1] >> 16) & 0xFF}.{(words[1] >> 8) & 0xFF}', capabilities=sorted(capabilities),
-                extensions=sorted(extensions),
+                extensions=sorted(extensions), execution_modes=execution_modes,
                 entry_points=[dict(model=e['model'], name=e['name']) for e in entry_points],
                 inputs=sorted(stage['inputs'], key=key), outputs=sorted(stage['outputs'], key=key),
                 spec_constants={str(decorations[c][DEC_SPEC_ID]): spec[c] for c in sorted(spec)

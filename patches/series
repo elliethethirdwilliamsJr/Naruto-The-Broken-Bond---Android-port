@@ -23,3 +23,7 @@ rexglue-seh-signal-chain.patch
 rexglue-physical-heap-release-order.patch
 rexglue-input-user-packet.patch
 rexglue-shared-register-calls.patch
+rexglue-optional-xenos-plugin.patch
+rexglue-android-core-compat.patch
+rexglue-android-runtime-platform.patch
+rexglue-posix-thread-repeat-wait.patch

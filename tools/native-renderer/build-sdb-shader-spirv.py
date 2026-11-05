@@ -13,6 +13,11 @@ stub of the DXIL path is taken off, as build-sdb-shader-libraries.py does: SPIR-
 reads constant_id(0), given when the pipeline is created. Each module goes through
 spirv-val in the same environment, and its interface (spirv_module.py) is recorded.
 
+With --clip-mode geometry, the six original clip computations are unchanged but
+their output declarations become user varyings at locations 18 and 19. The
+matching clip_planes_gs pass must be built and packaged in the same mode. Native
+clip-distance output remains the default; this option is explicit development.
+
 The report checks the corpus against the layout the Vulkan backend builds:
 - the descriptor bindings (2D, 3D and cube textures in sets 0 to 2, samplers in set 3,
   each an array at binding 0) and the 24-byte push constant block (the addresses of the
@@ -43,6 +48,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # shader_store (the scripts run with python -I).
 import shader_store
 import spirv_module
+import mobile_clip
+import mobile_descriptors
 
 STUB = '\nuint g_SpecConstants() { return 0; }\n'
 TARGET_ENVIRONMENT = 'vulkan1.2'
@@ -60,7 +67,11 @@ parser.add_argument('--masks', type=Path, required=True,
                     help='the report of build-sdb-shader-libraries.py, with the spec mask of each shader')
 parser.add_argument('--jobs', type=int, default=12)
 parser.add_argument('--store', type=Path, help='the content-addressed store (shader_store.py); none if absent')
+parser.add_argument('--clip-mode', choices=('native', 'geometry'), default='native')
+parser.add_argument('--descriptor-mode', choices=('runtime', 'bounded'), default='runtime')
 args = parser.parse_args()
+if args.descriptor_mode == 'bounded':
+    BINDINGS = {binding: kind.replace('[]', '[64]') for binding, kind in BINDINGS.items()}
 dxc, spirv_val = args.dxc.resolve(), args.spirv_val.resolve()
 cache, out = args.cache.resolve(), args.out.resolve()
 out.mkdir(parents=True, exist_ok=False)
@@ -98,9 +109,15 @@ def check(entry: dict, interface: dict, text: str):
         if set(interface['spec_constants']) - {'0'} or (entry['mask'] and '0' not in interface['spec_constants']):
             broken.append('pixel-spec-constants')
     else:
-        if located(interface['outputs']) != {loc: 'float4' for loc in range(INTERPOLATORS)}:
+        outputs = {loc: 'float4' for loc in range(INTERPOLATORS)}
+        if args.clip_mode == 'geometry':
+            outputs.update({18: 'float4', 19: 'float2'})
+        if located(interface['outputs']) != outputs:
             broken.append('vertex-interpolators')
-        if builtins(interface['outputs']) != {'Position': 'float4', 'ClipDistance': 'float[6]'}:
+        expected_builtins = {'Position': 'float4'}
+        if args.clip_mode == 'native':
+            expected_builtins['ClipDistance'] = 'float[6]'
+        if builtins(interface['outputs']) != expected_builtins:
             broken.append('vertex-builtins')
         declared = [(int(loc), kind, f'{usage}{index}') for loc, kind, usage, index in VERTEX_INPUT.findall(text)]
         entry['vertex_inputs'] = {semantic: loc for loc, _, semantic in declared}
@@ -119,7 +136,12 @@ def one(hlsl: Path, mask: int):
     text = hlsl.read_text(encoding='utf-8')
     entry = dict(name=stem, stage='ps' if pixel else 'vs', mask=mask, hlsl_sha256=sha(hlsl))
     source = out / 'hlsl' / hlsl.name
-    source.write_text(text[:-len(STUB)] + '\n' if text.endswith(STUB) else text, encoding='utf-8')
+    transformed = text[:-len(STUB)] + '\n' if text.endswith(STUB) else text
+    if not pixel and args.clip_mode == 'geometry':
+        transformed = mobile_clip.rewrite_vertex(transformed)
+    if args.descriptor_mode == 'bounded':
+        transformed = mobile_descriptors.rewrite(transformed)
+    source.write_text(transformed, encoding='utf-8')
     spirv = out / 'spirv' / (stem + '.spv')
     flags = arguments(pixel)
     compiled = shader_store.key('dxc', source.read_bytes(), *flags, dxc_id)
@@ -153,6 +175,10 @@ def one(hlsl: Path, mask: int):
     interface = spirv_module.parse(spirv.read_bytes())
     entry['interface'] = interface
     broken = check(entry, interface, text)
+    if args.descriptor_mode == 'bounded' and (
+            set(interface['capabilities']) & {'RuntimeDescriptorArray', 'ShaderNonUniform', 'SampledImageArrayNonUniformIndexing'} or
+            'SPV_EXT_descriptor_indexing' in interface['extensions']):
+        broken.append('bounded-descriptor-capabilities')
     if broken:
         entry['broken'] = broken
         entry['result'] = 'check-failed'
@@ -188,8 +214,12 @@ summary = dict(
     capabilities=union('capabilities'), extensions=union('extensions'),
     # The contract every module was checked against, and what the corpus uses of it.
     layout=dict(bindings=[dict(set=s, binding=b, type=t) for (s, b), t in sorted(BINDINGS.items())],
+                descriptor_mode=args.descriptor_mode,
+                **(dict(descriptor_slots=64, descriptor_limits=mobile_descriptors.limits()) if args.descriptor_mode == 'bounded' else {}),
                 push_constant_bytes=PUSH_CONSTANT_BYTES),
     stage_interface=dict(interpolators=INTERPOLATORS, interpolator_type='float4', clip_distances=6,
+                         clip_mode=args.clip_mode,
+                         **(dict(geometry_limits=mobile_clip.required_limits()) if args.clip_mode == 'geometry' else {}),
                          vertex_input_type='uint4', io_order='decl', vertex_y='inverted (-fvk-invert-y)'),
     bindings=sorted({(b['set'], b['binding'], b['type']) for r in ok for b in r['interface']['bindings']}),
     push_constant_bytes=sorted({r['interface']['push_constant_bytes'] for r in ok}),

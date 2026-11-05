@@ -41,10 +41,10 @@ bool ThreadTimes(void* native_thread, uint64_t& kernel_100ns, uint64_t& user_100
 // handle of the window (rex::ui::Window::GetNativeWindowHandle: the HWND on
 // Windows, the SDL_Window elsewhere), which ClientSize asks.
 struct NativeWindow {
-  enum class Kind { kNone, kWin32, kXlib, kWayland };
+  enum class Kind { kNone, kWin32, kXlib, kWayland, kAndroid };
   Kind kind = Kind::kNone;
   void* display = nullptr;  // HINSTANCE, X11 Display*, wl_display*
-  void* window = nullptr;   // HWND, X11 Window (the number), wl_surface*
+  void* window = nullptr;   // HWND, X11 Window (the number), wl_surface*, ANativeWindow*
   void* handle = nullptr;
 };
 NativeWindow WindowHandles(void* native_handle);

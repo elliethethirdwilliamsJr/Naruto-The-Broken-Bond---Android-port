@@ -1,0 +1,42 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -19,6 +19,7 @@ project(ReXGlue
+ #==========================================================
+ # Build Options
+ #==========================================================
++option(REXGLUE_BUILD_XENOS_PLUGIN "Build the optional Xenos GPU emulation plugin" ON)
+ option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+@@ -256,7 +257,9 @@ add_subdirectory(src/filesystem)
+ add_subdirectory(src/ui)
+ add_subdirectory(src/input)
+ add_subdirectory(src/audio)
+-add_subdirectory(src/graphics)
++if(REXGLUE_BUILD_XENOS_PLUGIN)
++    add_subdirectory(src/graphics)
++endif()
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+ add_subdirectory(src/codegen)
+diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
+--- a/cmake/rexglue_install.cmake
++++ b/cmake/rexglue_install.cmake
+@@ -14,12 +14,15 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rexglue_helpers.cmake)
+ # Build install target list dynamically based on backend options
+ set(REXGLUE_INSTALL_TARGETS
+     rexruntime
+-    rexgpu-xenos
+     disruptorplus renderdoc simde tomlplusplus
+     aes128 mspack o1heap disasm xxhash
+     libavcodec libavutil
+ )
+ 
++if(TARGET rexgpu-xenos)
++    list(APPEND REXGLUE_INSTALL_TARGETS rexgpu-xenos)
++endif()
++
+ if(REXGLUE_USE_VULKAN)
+     list(APPEND REXGLUE_INSTALL_TARGETS
+         SPIRV glslang MachineIndependent GenericCodeGen OSDependent OGLCompiler  # glslang

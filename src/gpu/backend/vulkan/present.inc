@@ -60,10 +60,13 @@ bool Backend::State::CreateSwapchain(uint32_t width, uint32_t height, std::strin
   std::vector<VkSurfaceFormatKHR> formats(count);
   if ((result = vkGetPhysicalDeviceSurfaceFormatsKHR(vulkan->physicalDevice, window_surface, &count, formats.data())) != VK_SUCCESS)
     return GraphicsError(evidence, "native-vulkan-surface-formats", result);
-  bool bgra = false;
-  for (const auto& format : formats) bgra |= format.format == VK_FORMAT_B8G8R8A8_UNORM &&
-      format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-  if (!bgra) return GraphicsError(evidence, "native-vulkan-surface-bgra8-unavailable", VK_ERROR_FORMAT_NOT_SUPPORTED);
+  const auto selected_format = SelectSurfaceFormat(formats);
+  if (selected_format == VK_FORMAT_UNDEFINED)
+    return GraphicsError(evidence, "native-vulkan-surface-unorm8-unavailable", VK_ERROR_FORMAT_NOT_SUPPORTED);
+  // RetireSwapchain completed the old render submissions before releasing a
+  // UI pipeline whose render-pass format no longer matches this surface.
+  if (selected_format != swap_format) ui_pipeline.reset();
+  swap_format = selected_format;
   if ((result = vkGetPhysicalDeviceSurfacePresentModesKHR(vulkan->physicalDevice, window_surface, &count, nullptr)) != VK_SUCCESS)
     return GraphicsError(evidence, "native-vulkan-present-modes", result);
   std::vector<VkPresentModeKHR> modes(count);
@@ -88,12 +91,22 @@ bool Backend::State::CreateSwapchain(uint32_t width, uint32_t height, std::strin
   info.minImageCount = std::max({present_mode.buffers, caps.minImageCount,
                                  swap_mode == VK_PRESENT_MODE_MAILBOX_KHR ? 3u : 0u});
   if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
-  info.imageFormat = VK_FORMAT_B8G8R8A8_UNORM; info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+  info.imageFormat = swap_format; info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
   info.imageExtent = swap_extent; info.imageArrayLayers = 1;
   info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   if ((caps.supportedUsageFlags & info.imageUsage) != info.imageUsage)
     return GraphicsError(evidence, "native-vulkan-swapchain-image-usage", VK_ERROR_FORMAT_NOT_SUPPORTED);
   info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE; info.preTransform = caps.currentTransform;
+#if defined(__ANDROID__)
+  // The final composite renders in window coordinates, without pre-rotating
+  // the image into the phone's natural portrait orientation. Tell Android to
+  // apply its presentation transform instead of claiming we already did it.
+  if (!(caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))
+    return GraphicsError(evidence, "native-vulkan-identity-transform-unavailable", VK_ERROR_FORMAT_NOT_SUPPORTED);
+  info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+#endif
+  swap_transform = info.preTransform;
+  surface_transform = caps.currentTransform;
   // Opaque where the surface offers it; otherwise the first mode it does (the
   // image's alpha is written opaque anyway).
   info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -155,7 +168,14 @@ VkResult CreateWindowSurface(VkInstance instance, const platform::NativeWindow& 
       return vkCreateXlibSurfaceKHR(instance, &info, nullptr, &surface);
     }
 #endif
-#if defined(__linux__)
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
+    case platform::NativeWindow::Kind::kAndroid: {
+      VkAndroidSurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+      info.window = static_cast<ANativeWindow*>(window.window);
+      return vkCreateAndroidSurfaceKHR(instance, &info, nullptr, &surface);
+    }
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
     case platform::NativeWindow::Kind::kWayland: {
       const auto create = reinterpret_cast<PFN_vkCreateWaylandSurfaceKHR>(
           vkGetInstanceProcAddr(instance, "vkCreateWaylandSurfaceKHR"));
@@ -212,9 +232,11 @@ bool Backend::AttachWindow(const platform::NativeWindow& window, std::string& ev
   if (sized && !s.CreateSwapchain(width, height, evidence)) return false;
   if (!s.EnsureOutput(evidence)) return false;
   evidence = fmt::format("{{\"attached\":true,\"backend\":\"vulkan\",\"retirement\":\"{}\","
-      "\"present_mode\":{},\"buffers\":{},\"effective_frame_latency\":1,\"generation\":{}}}",
+      "\"present_mode\":{},\"buffers\":{},\"effective_frame_latency\":1,\"generation\":{},"
+      "\"extent\":[{},{}],\"pre_transform\":{},\"surface_transform\":{}}}",
       s.present_fences ? "swapchain_maintenance1 (KHR/EXT)" : "queue-idle",
-      int(s.swap_mode), s.back_images.size(), s.swap_generation);
+      int(s.swap_mode), s.back_images.size(), s.swap_generation,
+      s.swap_extent.width, s.swap_extent.height, uint32_t(s.swap_transform), uint32_t(s.surface_transform));
   return true;
 }
 bool Backend::DetachWindow(std::string& evidence) {
@@ -403,7 +425,8 @@ bool Backend::State::OutputPass(OutputImage& input, VkImage output, SyncState& o
       desc.state[0] = 0x00010001; desc.state[1] = 15; desc.state[8] = 1; desc.state[18] = 1;
       // SDK rectangle uses a strip; the gamma shader uses a full-screen triangle.
       desc.state[10] = kind == 1 ? 1 : 0;
-      const auto made = MakeGraphicsPipeline(vulkan->vk, output_layouts[kind], desc, {}, pipeline, format, true);
+      const auto made = MakeGraphicsPipeline(vulkan->vk, output_layouts[kind], desc, {}, pipeline, format, true,
+                                            pipeline_compiler.get());
       if (!made.ok) return GraphicsError(evidence, made.reason, VkResult(made.code));
     }
     batch.retained.push_back(pipeline);

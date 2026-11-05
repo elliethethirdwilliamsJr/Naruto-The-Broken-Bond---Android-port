@@ -25,7 +25,7 @@ bool Backend::State::OutputEffects(OutputImage& source, BackImage& back, uint32_
   vkCmdClearColorImage(Commands(), back.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
   for (size_t i = 0; i < plan.size(); ++i) {
     const auto& step = plan[i]; const bool last = i + 1 == plan.size();
-    VkImage output = back.image; SyncState* sync = &back.state; VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkImage output = back.image; SyncState* sync = &back.state; VkFormat format = swap_format;
     uint32_t dw = swap_extent.width, dh = swap_extent.height, ox = x, oy = y;
     if (!last) {
       auto& target = effects[2 + i];
@@ -129,7 +129,7 @@ bool Backend::Present(uint32_t slot, bool capture, std::vector<uint8_t>& bgra, u
   if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
     s.Observe(result); return GraphicsError(evidence, "native-vulkan-acquire", result);
   }
-  if (result == VK_SUBOPTIMAL_KHR) s.recreate_swapchain = true;
+  if (result == VK_SUBOPTIMAL_KHR && s.RecreateForSuboptimal()) s.recreate_swapchain = true;
   s.acquire_pending = true;
   if (!s.WaitPresent(s.acquire_fence, evidence)) return false;
   s.acquire_pending = false;
@@ -156,7 +156,7 @@ bool Backend::Present(uint32_t slot, bool capture, std::vector<uint8_t>& bgra, u
   } else {
     const std::array<uint32_t, 12> c{bits(float(x)), bits(float(y)), bits(float(stage.width) / vw), bits(float(stage.height) / vh),
         stage.width, stage.height, bits(float(vw)), bits(float(vh))};
-    if (!s.OutputPass(stage, back.image, back.state, VK_FORMAT_B8G8R8A8_UNORM, s.swap_extent.width, s.swap_extent.height,
+    if (!s.OutputPass(stage, back.image, back.state, s.swap_format, s.swap_extent.width, s.swap_extent.height,
                       "present_ps", 0, c, page->buffer->buffer, ramp_offset, evidence)) return false;
   }
   // The UI layer over the image and its bars.
@@ -201,7 +201,10 @@ bool Backend::Present(uint32_t slot, bool capture, std::vector<uint8_t>& bgra, u
   back.pending = s.present_fences;
   stage.presented = true; ++s.presents;
   const VkResult present_result = result;
-  if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) s.recreate_swapchain = true;
+  if (result == VK_ERROR_OUT_OF_DATE_KHR) s.recreate_swapchain = true;
+  else if (result == VK_SUBOPTIMAL_KHR) {
+    if (s.RecreateForSuboptimal()) s.recreate_swapchain = true;
+  }
   else if (result == VK_ERROR_SURFACE_LOST_KHR) s.surface_lost = true;  // A new surface at the next frame.
   else if (result != VK_SUCCESS) {
     s.Observe(result); return GraphicsError(evidence, "native-vulkan-present", result);
@@ -212,12 +215,15 @@ bool Backend::Present(uint32_t slot, bool capture, std::vector<uint8_t>& bgra, u
       return GraphicsError(evidence, "native-present-capture-invalidate", result);
     width = s.swap_extent.width; height = s.swap_extent.height;
     bgra.assign(readback->mapped, readback->mapped + bytes);
+    // The public capture contract remains BGRA for both WSI formats.
+    if (s.swap_format == VK_FORMAT_R8G8B8A8_UNORM)
+      for (size_t at = 0; at < bgra.size(); at += 4) std::swap(bgra[at], bgra[at + 2]);
   }
   presented = present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR;
   evidence = fmt::format("{{\"presented\":{},\"backend\":\"vulkan\",\"present_result\":{},\"acquire_results\":[{}],"
       "\"generation\":{},\"image\":{},\"size\":[{},{}],\"fence\":{},\"present_mode\":{},\"effective_frame_latency\":1,"
-      "\"ui\":{}}}",
+      "\"swapchain_format\":{},\"ui\":{}}}",
       presented, int32_t(present_result), fmt::join(acquire_results, ","), s.swap_generation, index, s.swap_extent.width,
-      s.swap_extent.height, sequence, int(s.swap_mode), ui);
+      s.swap_extent.height, sequence, int(s.swap_mode), int(s.swap_format), ui);
   return true;
 }

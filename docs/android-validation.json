@@ -1,0 +1,77 @@
+{
+  "checkpoint": "2026-11-05",
+  "apk_version": "0.4.0",
+  "version_code": 8,
+  "device": {
+    "model": "OPPO A58 CPH2577",
+    "os": "Android 15",
+    "abi": "arm64-v8a",
+    "gpu": "Mali-G52 MC2"
+  },
+  "gameplay": {
+    "observed_scenes": [
+      "intro",
+      "menu",
+      "player selection",
+      "Sasuke vs Naruto training fight"
+    ],
+    "fps": {
+      "approximate": 1,
+      "source": "user report",
+      "calibrated_measurement": false
+    }
+  },
+  "sdk_patch_replay": {
+    "sdk_pin": "c94f5ebdcb3c9d1a460ca48e04f9758448f8d518",
+    "patches": 28,
+    "compared_files": 49,
+    "mismatches": []
+  },
+  "driver_cache_probe": {
+    "passed": true,
+    "records": [
+      {
+        "case": "cold",
+        "wall_seconds": 8.243824600001972,
+        "cache": {
+          "enabled": true,
+          "loaded_bytes": 0,
+          "saved_bytes": 0,
+          "created": 0
+        },
+        "comparisons": 16,
+        "passed": true
+      },
+      {
+        "case": "warm",
+        "wall_seconds": 3.341748099999677,
+        "cache": {
+          "enabled": true,
+          "loaded_bytes": 183256,
+          "saved_bytes": 0,
+          "created": 0
+        },
+        "comparisons": 16,
+        "passed": true
+      },
+      {
+        "case": "corrupt",
+        "wall_seconds": 5.491136900003767,
+        "cache": {
+          "enabled": true,
+          "loaded_bytes": 0,
+          "saved_bytes": 0,
+          "created": 0
+        },
+        "comparisons": 16,
+        "passed": true
+      }
+    ],
+    "cold_to_warm_ratio": 2.4669198136157444
+  },
+  "limits": [
+    "Isolated cache timing is not a gameplay benchmark.",
+    "Full-game warm-start timing is pending.",
+    "No end-to-end fresh-clone Android build validated."
+  ]
+}

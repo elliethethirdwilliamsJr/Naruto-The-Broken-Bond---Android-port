@@ -1,0 +1,26 @@
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -1017,6 +1017,11 @@
+   static void* ThreadStartRoutine(void* parameter);
+   inline bool signaled() const override { return signaled_; }
+   inline void post_execution() override {
++    // A terminated thread stays signaled: Wait, WaitAll and WaitAny may all
++    // observe it repeatedly. Their base-condition lock serializes this
++    // cleanup, including concurrent waiters. Joining a released pthread_t
++    // again aborts on Android, and destroying its semaphore twice is invalid.
++    if (completion_reaped_) return;
+     if (thread_) {
+       pthread_join(thread_, nullptr);
+     }
+@@ -1028,8 +1033,10 @@
+ #else
+     sem_destroy(&suspend_sem_);
+ #endif
++    completion_reaped_ = true;
+   }
+   pthread_t thread_;
++  bool completion_reaped_ = false;  // Protected by PosixConditionBase::mutex_.
+   bool signaled_;
+   int exit_code_;
+   State state_;             // Protected by state_mutex_

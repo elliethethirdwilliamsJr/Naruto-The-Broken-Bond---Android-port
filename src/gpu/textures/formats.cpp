@@ -1,6 +1,8 @@
 // Guest texture formats of the renderer (formats.h).
 #include "gpu/textures/formats.h"
+#include "gpu/textures/upload_fallback.h"
 #include <array>
+#include <bit>
 #include <cstring>
 #include <utility>
 
@@ -280,5 +282,47 @@ void ConvertLevel(TexelConversion conversion, std::vector<uint8_t>& data, uint32
                       &block_texels[(y * 4 + x) * texel_bytes], texel_bytes);
     }
   data.swap(texels);
+}
+TextureFormat DecodedSampledFormat(TextureFormat source) {
+  switch (source) {
+    case TextureFormat::kBC1Unorm:
+    case TextureFormat::kBC3Unorm: return TextureFormat::kR8G8B8A8Unorm;
+    case TextureFormat::kBC4Unorm: return TextureFormat::kR8Unorm;
+    case TextureFormat::kBC5Unorm: return TextureFormat::kR8G8Unorm;
+    default: return TextureFormat::kUnknown;
+  }
+}
+
+bool DecodeSampledData(const DrawTexture& source, TextureFormat destination,
+                       std::vector<std::vector<uint8_t>>& output, std::string& reason) {
+  output.clear();
+  reason.clear();
+  auto fail = [&](const char* text) { reason = text; return false; };
+  if (destination == TextureFormat::kUnknown || destination != DecodedSampledFormat(source.format))
+    return fail("sampled-decode-format");
+  if (source.resolved || !source.width || !source.height || source.width > 8192 || source.height > 8192 ||
+      !source.levels || source.levels > 13 || source.levels > std::bit_width(std::max(source.width, source.height)) ||
+      (source.cube && source.width != source.height) ||
+      source.data.size() != source.levels * (source.cube ? 6u : 1u))
+    return fail("sampled-decode-description");
+  // Validate the complete input before entering the existing unchecked decoder.
+  for (uint32_t i = 0; i < source.data.size(); ++i) {
+    const auto rows = RowsOfLevel(source.format, source.width, source.height, i % source.levels);
+    if (source.data[i].size() != size_t(rows.rows) * rows.row_bytes)
+      return fail("sampled-decode-data-size");
+  }
+  const auto conversion = source.format == TextureFormat::kBC1Unorm ? TexelConversion::kDXT1ToRGBA8 :
+                          source.format == TextureFormat::kBC3Unorm ? TexelConversion::kDXT5ToRGBA8 :
+                          source.format == TextureFormat::kBC4Unorm ? TexelConversion::kDXT5AToR8 :
+                                                                   TexelConversion::kDXNToRG8;
+  std::vector<std::vector<uint8_t>> converted(source.data.size());
+  for (uint32_t i = 0; i < source.data.size(); ++i) {
+    const uint32_t level = i % source.levels;
+    const uint32_t width = std::max(source.width >> level, 1u), height = std::max(source.height >> level, 1u);
+    converted[i] = source.data[i];
+    ConvertLevel(conversion, converted[i], (width + 3) / 4, (height + 3) / 4, width, height);
+  }
+  output.swap(converted);
+  return true;
 }
 }  // namespace gpu

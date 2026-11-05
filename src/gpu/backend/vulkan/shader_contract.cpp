@@ -84,10 +84,20 @@ std::vector<std::string> MissingFromDevice(const ShaderContract& contract, const
     // ddy_coarse, the getGradients of the translated cel and blur shaders.
     if (name == "Shader" || name == "ImageQuery" || name == "DerivativeControl") has = true;
     else if (name == "ClipDistance") has = features.shaderClipDistance;
+    else if (name == "Geometry") {
+      has = features.geometryShader;
+      // The optional user-clip pass: 18 float4 interpolators, six distances
+      // plus Position in; Position and interpolators out, at most nine vertices.
+      if (limits.maxVertexOutputComponents < 82 || limits.maxGeometryInputComponents < 82 ||
+          limits.maxGeometryOutputComponents < 76 || limits.maxGeometryOutputVertices < 9 ||
+          limits.maxGeometryTotalOutputComponents < 684)
+        missing.push_back("geometry:clip-interface-limits");
+    }
     else if (name == "Int64") has = features.shaderInt64;
     else if (name == "StorageImageExtendedFormats") has = features.shaderStorageImageExtendedFormats;
     else if (name == "PhysicalStorageBufferAddresses") has = enabled.bufferDeviceAddress;
     else if (name == "RuntimeDescriptorArray") has = enabled.descriptorIndexing;
+    else if (name == "SampledImageArrayDynamicIndexing") has = features.shaderSampledImageArrayDynamicIndexing;
     else {
       missing.push_back("capability:" + name + ":unmapped");
       continue;
@@ -105,6 +115,14 @@ std::vector<std::string> MissingFromDevice(const ShaderContract& contract, const
     if (b.type.ends_with("[]")) {
       // The arrays of the draw layout, indexed by the shaders (bindless).
       if (!enabled.descriptorIndexing) missing.push_back(name + ":descriptor-indexing");
+    } else if (b.type.ends_with("[64]")) {
+      const char* expected[] = {"image2D<float>[64]", "image3D<float>[64]", "imageCube<float>[64]", "sampler[64]"};
+      if (b.layout != "draw" || b.set >= 4 || b.binding != 0 || b.type != expected[b.set])
+        missing.push_back(name + ":bounded-layout");
+      if (!features.shaderSampledImageArrayDynamicIndexing || limits.maxPerStageDescriptorSampledImages < 192 ||
+          limits.maxPerStageDescriptorSamplers < 64 || limits.maxPerStageResources < 256 ||
+          limits.maxDescriptorSetSampledImages < 192 || limits.maxDescriptorSetSamplers < 64)
+        missing.push_back(name + ":bounded-limits");
     } else if (b.type == "uniform-buffer") {
       uint32_t bytes = 0;
       if (!Number(b.detail, bytes) || bytes > limits.maxUniformBufferRange) missing.push_back(name + ":uniform-range");

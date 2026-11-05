@@ -601,6 +601,7 @@ bool Dispatcher::Shutdown(std::string& evidence) {
     JoinPipelineThread(*thread);
     ++pool_joined;
   }
+  state_->pool.clear();  // Shutdown may be retried or called again by destruction.
   auto result = std::make_shared<std::promise<std::pair<bool, std::string>>>();
   auto future = result->get_future();
   auto shutdown = [this, result] {

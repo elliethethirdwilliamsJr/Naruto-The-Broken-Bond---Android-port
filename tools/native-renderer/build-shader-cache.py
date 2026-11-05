@@ -44,6 +44,8 @@ parser.add_argument('--compressor', type=Path, required=True, help='the Zstandar
 parser.add_argument('--spirv-val', type=Path)
 parser.add_argument('--smolv-encode', type=Path)
 parser.add_argument('--passes', type=Path, help='the backend folder of the passes (build-pass-spirv.py)')
+parser.add_argument('--vulkan-clip-mode', choices=('native', 'geometry'), default='native')
+parser.add_argument('--vulkan-descriptor-mode', choices=('runtime', 'bounded'), default='runtime')
 args = parser.parse_args()
 if len({bool(args.spirv_val), bool(args.smolv_encode), bool(args.passes)}) != 1:
     sys.exit('build-shader-cache: SPIR-V needs --spirv-val, --smolv-encode and --passes')
@@ -57,7 +59,10 @@ work = out / 'work'
 if work.exists():
     shutil.rmtree(work)
 work.mkdir(parents=True)
-jobs = str(max(1, os.cpu_count() or 4))
+# DXC workers can have a separate cap from the C++ build, whose large generated
+# translation units consume more memory. Otherwise honor the parent's limit.
+jobs = str(max(1, int(os.environ.get('BROKENBOND_SHADER_JOBS') or
+                     os.environ.get('CMAKE_BUILD_PARALLEL_LEVEL') or os.cpu_count() or 4)))
 # The spec constant values the draw asks for (draw.cpp): SPEC_CONSTANT_ALPHA_TEST, and
 # SPEC_CONSTANT_ALPHA_TO_COVERAGE in its place for transparency antialiasing.
 SPEC_VALUES = '2,8'
@@ -88,9 +93,10 @@ run('build-sdb-shader-variants.py', work / 'libraries', work / 'variants', '--jo
 steps = ['per-shader', 'libraries', 'variants']
 if args.spirv_val:
     run('build-sdb-shader-spirv.py', work / 'per-shader', work / 'spirv', '--jobs', jobs, '--dxc', dxc,
-        '--spirv-val', args.spirv_val.resolve(), '--masks', work / 'libraries' / 'report.json', *store)
+        '--spirv-val', args.spirv_val.resolve(), '--masks', work / 'libraries' / 'report.json',
+        '--clip-mode', args.vulkan_clip_mode, '--descriptor-mode', args.vulkan_descriptor_mode, *store)
     run('build-pass-spirv.py', args.passes.resolve(), work / 'passes', '--dxc', dxc,
-        '--spirv-val', args.spirv_val.resolve(), *store)
+        '--spirv-val', args.spirv_val.resolve(), '--clip-mode', args.vulkan_clip_mode, *store)
     steps += ['spirv', 'passes']
 bad = {k: v for step in steps for k, v in failures(work / step / 'report.json').items()}
 if bad:

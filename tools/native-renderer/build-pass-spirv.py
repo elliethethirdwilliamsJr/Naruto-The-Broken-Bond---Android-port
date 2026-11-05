@@ -6,6 +6,8 @@ Vulkan backend: the presentation with the gamma ramp, the UI layer and the resol
 Usage: python -I build-pass-spirv.py <backend dir> <new output dir> --dxc <dxc.exe> --spirv-val <spirv-val.exe>
        [--store <dir>]
 
+--clip-mode geometry adds the shared geometry clipper; native remains the default.
+
 The own passes and FXAA are compiled from their HLSL, the source of the DXIL and DXBC
 the D3D12 backend runs, in the environment of the game's shaders
 (build-sdb-shader-spirv.py): Vulkan 1.2, the DX layout, -fvk-invert-y in a VS, and the
@@ -36,15 +38,17 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # shader_store (the scripts run with python -I).
 import shader_store
 import spirv_module
+import mobile_clip
 
 TARGET_ENVIRONMENT = 'vulkan1.2'
-PROFILES = {'vs': 'vs_6_0', 'ps': 'ps_6_0', 'cs': 'cs_6_0'}
-MODELS = {'vs': 'vertex', 'ps': 'fragment', 'cs': 'compute'}
+PROFILES = {'vs': 'vs_6_0', 'ps': 'ps_6_0', 'cs': 'cs_6_0', 'gs': 'gs_6_0'}
+MODELS = {'vs': 'vertex', 'ps': 'fragment', 'cs': 'compute', 'gs': 'geometry'}
 # The pipeline layouts of the passes: the descriptor type of each binding of set 0 (with
 # the format of a storage image, the bytes of a uniform buffer) and the push constant
 # range [offset, end) of each stage. The sampler of fxaa and effect is the static
 # sampler of D3D12: linear, clamp.
 LAYOUTS = {
+    'clip': dict(bindings={}, push_constants={}),
     'present': dict(bindings={0: ('sampled-image', None), 1: ('uniform-buffer', 4096)},
                     push_constants=dict(fragment=(0, 32))),
     'resolve': dict(bindings={0: ('sampled-image', None)}, push_constants=dict(fragment=(0, 8))),
@@ -96,7 +100,10 @@ parser.add_argument('out', type=Path)
 parser.add_argument('--dxc', type=Path, required=True)
 parser.add_argument('--spirv-val', type=Path, required=True)
 parser.add_argument('--store', type=Path, help='the content-addressed store (shader_store.py); none if absent')
+parser.add_argument('--clip-mode', choices=('native', 'geometry'), default='native')
 args = parser.parse_args()
+if args.clip_mode == 'geometry':
+    PASSES.append(hlsl('clip_planes_gs', 'clip', 'gs', 'clip_planes.hlsl', 'main', includes=['clip_interface.hlsli']))
 dxc, spirv_val = args.dxc.resolve(), args.spirv_val.resolve()
 backend, out = args.backend.resolve(), args.out.resolve()
 out.mkdir(parents=True, exist_ok=False)
@@ -147,6 +154,8 @@ def check(entry: dict, interface: dict):
     layout, model = LAYOUTS[entry['layout']], MODELS[entry['stage']]
     if [(e['model'], e['name']) for e in interface['entry_points']] != [(model, 'main')]:
         broken.append('entry-point')
+    if entry['name'] == 'clip_planes_gs' and not mobile_clip.check_geometry(interface):
+        broken.append('geometry-clip-interface')
     for b in interface['bindings']:
         kind, detail = descriptor(b)
         expected = layout['bindings'].get(b['binding']) if b['set'] == 0 else None

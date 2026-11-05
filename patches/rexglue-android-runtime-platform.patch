@@ -1,0 +1,486 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -19,6 +19,7 @@
+ # Build Options
+ #==========================================================
+ option(REXGLUE_BUILD_XENOS_PLUGIN "Build the optional Xenos GPU emulation plugin" ON)
++option(REXGLUE_EXTERNAL_RENDERER "Use a host-supplied renderer without SDK GPU backends" OFF)
+ option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+@@ -44,7 +45,9 @@
+ endif()
+ 
+ if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
+-    message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
++    if(NOT REXGLUE_EXTERNAL_RENDERER OR REXGLUE_BUILD_XENOS_PLUGIN)
++        message(FATAL_ERROR "Enable an SDK graphics backend, or use REXGLUE_EXTERNAL_RENDERER with the Xenos plugin disabled")
++    endif()
+ endif()
+ 
+ if (REXGLUE_ENABLE_FIDELITYFX AND
+@@ -159,6 +162,14 @@
+         message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
+     endif()
+     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
++elseif(ANDROID)
++    if(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
++        set(REX_PLATFORM "android-arm64")
++    elseif(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
++        set(REX_PLATFORM "android-amd64")
++    else()
++        message(FATAL_ERROR "Unsupported Android architecture: ${REX_TARGET_PROCESSOR}")
++    endif()
+ elseif(UNIX AND NOT APPLE)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "linux-amd64")
+--- a/include/rex/platform/fpscr.h
++++ b/include/rex/platform/fpscr.h
+@@ -75,7 +75,10 @@
+     return csr;
+   }
+ 
+-  static inline void setcsr(u32 csr) noexcept { __asm__ __volatile__("msr fpcr, %0" : : "r"(csr)); }
++  static inline void setcsr(u32 csr) noexcept {
++    const u64 value = csr;
++    __asm__ __volatile__("msr fpcr, %0" : : "r"(value));
++  }
+ 
+   static inline void InitHostExceptions(u32& csr) noexcept {
+     csr &= ~ExceptionMask;  // Clear enable bits to disable exceptions
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -20,7 +20,9 @@
+ // before including <ucontext.h>.
+ #define _XOPEN_SOURCE 700
+ #endif
++#if !REX_PLATFORM_ANDROID
+ #include <ucontext.h>
++#endif
+ #include <cstdint>
+ #include <vector>
+ #endif
+@@ -56,6 +58,14 @@
+ #if REX_PLATFORM_WIN32
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
++#elif REX_PLATFORM_ANDROID
++  struct AndroidContext;
++  AndroidContext* context_ = nullptr;
++  std::vector<uint8_t> stack_;
++  void (*entry_)(void*) = nullptr;
++  void* arg_ = nullptr;
++  bool is_thread_fiber_ = false;
++  static void Trampoline();
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   ucontext_t context_{};
+   std::vector<uint8_t> stack_;
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -24,8 +24,34 @@
+ )
+ add_library(rex::core ALIAS rexcore)
+ 
+-if(APPLE)
+-    # Apple's libc++ still gates std::jthread/std::stop_token behind the
++if(ANDROID)
++    set(REXGLUE_LIBUCONTEXT_SOURCE_DIR "" CACHE PATH "Pinned libucontext source for Android fibers")
++    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
++        message(FATAL_ERROR "The Android fiber backend currently requires ARM64")
++    endif()
++    if(NOT EXISTS "${REXGLUE_LIBUCONTEXT_SOURCE_DIR}/arch/aarch64/swapcontext.S")
++        message(FATAL_ERROR "Set REXGLUE_LIBUCONTEXT_SOURCE_DIR to the pinned libucontext checkout")
++    endif()
++    enable_language(ASM)
++    set(_uc "${REXGLUE_LIBUCONTEXT_SOURCE_DIR}")
++    add_library(rex_android_ucontext STATIC
++        "${_uc}/arch/aarch64/getcontext.S" "${_uc}/arch/aarch64/setcontext.S"
++        "${_uc}/arch/aarch64/swapcontext.S" "${_uc}/arch/aarch64/makecontext.c"
++        "${_uc}/arch/aarch64/trampoline.c")
++    target_compile_definitions(rex_android_ucontext PRIVATE FREESTANDING)
++    target_include_directories(rex_android_ucontext PRIVATE
++        "${_uc}/include" "${_uc}/arch/aarch64/include" "${_uc}/arch/aarch64" "${_uc}/arch/common")
++    target_compile_options(rex_android_ucontext PRIVATE
++        $<$<COMPILE_LANGUAGE:C>:-fomit-frame-pointer> $<$<COMPILE_LANGUAGE:C>:-Wno-unknown-attributes>)
++    target_include_directories(rexcore PRIVATE "${_uc}/include" "${_uc}/arch/aarch64/include")
++    target_sources(rexcore PRIVATE fiber_android.cpp filesystem_android.cpp)
++    target_link_libraries(rexcore PRIVATE rex_android_ucontext m c++experimental SDL3::SDL3)
++elseif(UNIX)
++    target_sources(rexcore PRIVATE fiber_posix.cpp)
++endif()
++
++if(APPLE OR ANDROID)
++    # These libc++ versions gate std::jthread/std::stop_token behind the
+     # experimental-library feature flag. Only timer_queue.cpp uses them, and
+     # neither type crosses a header boundary.
+     set_source_files_properties(timer_queue.cpp PROPERTIES
+@@ -63,7 +89,6 @@
+         dynlib_posix.cpp
+         exception_handler_posix.cpp
+         filesystem_posix.cpp
+-        fiber_posix.cpp
+         mapped_memory_posix.cpp
+         math_gcc.cpp
+         memory_posix.cpp
+@@ -98,7 +123,9 @@
+     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
+ )
+ 
+-if(APPLE)
++if(ANDROID)
++    target_link_libraries(rexcore PRIVATE dl)
++elseif(APPLE)
+     target_link_libraries(rexcore PRIVATE pthread)
+ elseif(UNIX)
+     target_link_libraries(rexcore PRIVATE pthread rt dl)
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -60,7 +60,10 @@
+ 
+ namespace rex::input::mnk {
+ namespace {
+-std::atomic<std::shared_ptr<const Profile>> host_profile;
++// The NDK libc++ lacks atomic<shared_ptr>. Publish immutable snapshots under a
++// mutex; release the replaced profile after unlocking to allow reentrant deleters.
++std::shared_ptr<const Profile> host_profile;
++std::mutex host_profile_mutex;
+ double MotionValue(std::string_view token, double dx, double dy) {
+   if (token == "MouseUp") return std::max(0.0, -dy);
+   if (token == "MouseDown") return std::max(0.0, dy);
+@@ -79,8 +82,14 @@
+   return result;
+ }
+ }
+-void SetProfile(std::shared_ptr<const Profile> profile) { host_profile.store(std::move(profile)); }
+-std::shared_ptr<const Profile> GetProfile() { return host_profile.load(); }
++void SetProfile(std::shared_ptr<const Profile> profile) {
++  std::lock_guard lock(host_profile_mutex);
++  host_profile.swap(profile);
++}
++std::shared_ptr<const Profile> GetProfile() {
++  std::lock_guard lock(host_profile_mutex);
++  return host_profile;
++}
+ 
+ namespace {
+ 
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -68,6 +68,8 @@
+     set(REXUI_PLATFORM_SOURCES
+         surface_win.cpp
+     )
++elseif(ANDROID)
++    set(REXUI_PLATFORM_SOURCES surface_android.cpp)
+ elseif(APPLE)
+     set(REXUI_PLATFORM_SOURCES
+         surface_mac.cpp
+@@ -146,7 +148,9 @@
+ endif()
+ 
+ # Platform-specific dependencies
+-if(UNIX AND NOT APPLE)
++if(ANDROID)
++    target_link_libraries(rexui PUBLIC android)
++elseif(UNIX AND NOT APPLE)
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -30,6 +30,8 @@
+ 
+ #if REX_PLATFORM_WIN32
+ #include <rex/ui/surface_win.h>
++#elif REX_PLATFORM_ANDROID
++#include <rex/ui/surface_android.h>
+ #elif REX_PLATFORM_MAC
+ #include <CoreFoundation/CoreFoundation.h>
+ #include <SDL3/SDL_metal.h>
+@@ -137,6 +139,9 @@
+   // SDL window coordinates are physical pixels on Windows and X11. Cocoa
+   // uses logical points and applies the backing scale itself.
+   SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
++#if REX_PLATFORM_ANDROID
++  flags |= SDL_WINDOW_VULKAN;
++#endif
+ #if REX_PLATFORM_MAC
+   int initial_width = int(GetDesiredLogicalWidth());
+   int initial_height = int(GetDesiredLogicalHeight());
+@@ -377,7 +382,13 @@
+   if (!sdl_window_) {
+     return nullptr;
+   }
+-#if REX_PLATFORM_WIN32
++#if REX_PLATFORM_ANDROID
++  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
++    auto* window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
++        SDL_GetWindowProperties(sdl_window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
++    if (window) return std::make_unique<AndroidNativeWindowSurface>(window);
++  }
++#elif REX_PLATFORM_WIN32
+   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+   if (allowed_types & Surface::kTypeFlag_Win32Hwnd) {
+     HWND hwnd = static_cast<HWND>(
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -293,7 +293,7 @@
+ 
+ # Linux video and audio backends. Both video drivers are always built so the
+ # one in use stays a runtime choice.
+-if(UNIX AND NOT APPLE)
++if(UNIX AND NOT APPLE AND NOT ANDROID)
+     set(SDL_X11               ON  CACHE BOOL "" FORCE)
+     set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
+     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
+--- /dev/null
++++ b/include/rex/ui/surface_android.h
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include <android/native_window.h>
++#include <rex/ui/surface.h>
++
++namespace rex::ui {
++
++// Keep the current surface alive while a renderer owns its presentation target.
++// A replacement Android surface must be attached as a new Surface instance.
++class AndroidNativeWindowSurface final : public Surface {
++ public:
++  explicit AndroidNativeWindowSurface(ANativeWindow* window);
++  ~AndroidNativeWindowSurface() override;
++  TypeIndex GetType() const override { return kTypeIndex_AndroidNativeWindow; }
++  ANativeWindow* window() const { return window_; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;
++
++ private:
++  ANativeWindow* window_;
++};
++
++}  // namespace rex::ui
+--- /dev/null
++++ b/src/ui/surface_android.cpp
+@@ -0,0 +1,24 @@
++#include <rex/ui/surface_android.h>
++
++namespace rex::ui {
++
++AndroidNativeWindowSurface::AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {
++  if (window_) ANativeWindow_acquire(window_);
++}
++
++AndroidNativeWindowSurface::~AndroidNativeWindowSurface() {
++  if (window_) ANativeWindow_release(window_);
++}
++
++bool AndroidNativeWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
++  width_out = height_out = 0;
++  if (!window_) return false;
++  const int32_t width = ANativeWindow_getWidth(window_);
++  const int32_t height = ANativeWindow_getHeight(window_);
++  if (width <= 0 || height <= 0) return false;
++  width_out = uint32_t(width);
++  height_out = uint32_t(height);
++  return true;
++}
++
++}  // namespace rex::ui
+--- /dev/null
++++ b/src/core/fiber_android.cpp
+@@ -0,0 +1,101 @@
++#include <rex/thread/fiber.h>
++
++#include <algorithm>
++#include <cassert>
++#include <cfenv>
++#include <cstdlib>
++#include <pthread.h>
++#include <signal.h>
++
++// The freestanding context layout is private to this backend. Its sigcontext
++// tag must not collide with Android's kernel signal-context definition.
++namespace native_context {
++#include <libucontext/libucontext.h>
++}
++
++namespace rex::thread {
++
++struct Fiber::AndroidContext {
++  native_context::libucontext_ucontext_t native{};
++  std::fenv_t floating_point{};
++  sigset_t signal_mask{};
++
++  bool CaptureState() {
++    return std::fegetenv(&floating_point) == 0 &&
++           pthread_sigmask(SIG_SETMASK, nullptr, &signal_mask) == 0;
++  }
++  bool RestoreState() {
++    return std::fesetenv(&floating_point) == 0 &&
++           pthread_sigmask(SIG_SETMASK, &signal_mask, nullptr) == 0;
++  }
++};
++
++thread_local Fiber* Fiber::tls_current_ = nullptr;
++
++Fiber* Fiber::ConvertCurrentThread() {
++  if (tls_current_) return tls_current_;
++  auto* fiber = new Fiber();
++  fiber->context_ = new AndroidContext();
++  if (!fiber->context_->CaptureState() ||
++      native_context::libucontext_getcontext(&fiber->context_->native) != 0) {
++    delete fiber->context_;
++    delete fiber;
++    return nullptr;
++  }
++  fiber->is_thread_fiber_ = true;
++  tls_current_ = fiber;
++  return fiber;
++}
++
++Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++  if (!entry) return nullptr;
++  auto* fiber = new Fiber();
++  fiber->context_ = new AndroidContext();
++  fiber->entry_ = entry;
++  fiber->arg_ = arg;
++  fiber->stack_.resize(std::max<size_t>(stack_size ? stack_size : 1024 * 1024, 16384));
++  if (!fiber->context_->CaptureState() ||
++      native_context::libucontext_getcontext(&fiber->context_->native) != 0) {
++    delete fiber->context_;
++    delete fiber;
++    return nullptr;
++  }
++  auto& context = fiber->context_->native;
++  context.uc_stack.ss_sp = fiber->stack_.data();
++  context.uc_stack.ss_size = fiber->stack_.size();
++  context.uc_link = nullptr;
++  native_context::libucontext_makecontext(&context, &Fiber::Trampoline, 0);
++  return fiber;
++}
++
++void Fiber::Trampoline() {
++  Fiber* fiber = tls_current_;
++  fiber->entry_(fiber->arg_);
++}
++
++void Fiber::SwitchTo(Fiber* target) {
++  Fiber* from = tls_current_;
++  if (!from || !target || !target->context_) std::abort();
++  if (from == target) return;
++  if (!from->context_->CaptureState() || !target->context_->RestoreState()) std::abort();
++  // x18 is Android's thread-reserved platform register, not fiber-local state.
++  uintptr_t platform_register;
++  asm volatile("mov %0, x18" : "=r"(platform_register));
++  target->context_->native.uc_mcontext.regs[18] = platform_register;
++  tls_current_ = target;
++  if (native_context::libucontext_swapcontext(&from->context_->native, &target->context_->native) != 0)
++    std::abort();
++}
++
++void Fiber::Destroy() {
++  if (is_thread_fiber_) {
++    assert(this == tls_current_);
++    tls_current_ = nullptr;
++  } else {
++    assert(this != tls_current_);
++  }
++  delete context_;
++  delete this;
++}
++
++}  // namespace rex::thread
+--- /dev/null
++++ b/src/core/filesystem_android.cpp
+@@ -0,0 +1,90 @@
++#include <rex/filesystem.h>
++#include <rex/string.h>
++#include <SDL3/SDL_init.h>
++#include <SDL3/SDL_system.h>
++#include <jni.h>
++#include <cerrno>
++#include <climits>
++#include <exception>
++
++namespace rex::filesystem {
++
++int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode) {
++  if (uri.empty() || uri.find('\0') != std::string_view::npos || !mode) {
++    errno = EINVAL;
++    return -1;
++  }
++  // SDL's Java bridge is initialized by the Android activity/video context.
++  // Analysis tools without a Java activity may still open ordinary POSIX files.
++  if (!SDL_WasInit(SDL_INIT_VIDEO)) {
++    errno = ENODEV;
++    return -1;
++  }
++  auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
++  if (!env) { errno = ENODEV; return -1; }
++  auto fail = [&](int error) {
++    if (env->ExceptionCheck()) env->ExceptionClear();
++    errno = error;
++    return -1;
++  };
++  if (env->PushLocalFrame(16) < 0) return fail(ENOMEM);
++  struct LocalFrame {
++    JNIEnv* env;
++    ~LocalFrame() { env->PopLocalFrame(nullptr); }
++  } frame{env};
++  jobject context = static_cast<jobject>(SDL_GetAndroidActivity());
++  if (!context || env->ExceptionCheck()) return fail(ENODEV);
++  jclass context_class = env->GetObjectClass(context);
++  if (!context_class || env->ExceptionCheck()) return fail(EIO);
++  jmethodID get_resolver = env->GetMethodID(context_class, "getContentResolver",
++                                         "()Landroid/content/ContentResolver;");
++  if (!get_resolver || env->ExceptionCheck()) return fail(EIO);
++  jobject resolver = env->CallObjectMethod(context, get_resolver);
++  if (!resolver || env->ExceptionCheck()) return fail(EIO);
++  jclass uri_class = env->FindClass("android/net/Uri");
++  if (!uri_class || env->ExceptionCheck()) return fail(EIO);
++  jmethodID parse = env->GetStaticMethodID(uri_class, "parse", "(Ljava/lang/String;)Landroid/net/Uri;");
++  if (!parse || env->ExceptionCheck()) return fail(EIO);
++  std::u16string text;
++  try { text = rex::string::to_utf16(uri); }
++  catch (const std::exception&) { return fail(EINVAL); }
++  if (text.size() > INT_MAX) return fail(EOVERFLOW);
++  jstring uri_string = env->NewString(reinterpret_cast<const jchar*>(text.data()), jsize(text.size()));
++  if (!uri_string || env->ExceptionCheck()) return fail(ENOMEM);
++  jobject parsed_uri = env->CallStaticObjectMethod(uri_class, parse, uri_string);
++  if (!parsed_uri || env->ExceptionCheck()) return fail(EINVAL);
++  jclass resolver_class = env->GetObjectClass(resolver);
++  if (!resolver_class || env->ExceptionCheck()) return fail(EIO);
++  jmethodID open = env->GetMethodID(resolver_class, "openFileDescriptor",
++      "(Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;");
++  if (!open || env->ExceptionCheck()) return fail(EIO);
++  jclass parcel_class = env->FindClass("android/os/ParcelFileDescriptor");
++  if (!parcel_class || env->ExceptionCheck()) return fail(EIO);
++  jmethodID detach = env->GetMethodID(parcel_class, "detachFd", "()I");
++  if (!detach || env->ExceptionCheck()) return fail(EIO);
++  jmethodID close = env->GetMethodID(parcel_class, "close", "()V");
++  if (!close || env->ExceptionCheck()) return fail(EIO);
++  jstring java_mode = env->NewStringUTF(mode);
++  if (!java_mode || env->ExceptionCheck()) return fail(ENOMEM);
++  jobject parcel = env->CallObjectMethod(resolver, open, parsed_uri, java_mode);
++  if (!parcel || env->ExceptionCheck()) return fail(EIO);
++  struct ParcelCloser {
++    JNIEnv* env;
++    jobject parcel;
++    jmethodID close;
++    bool detached = false;
++    ~ParcelCloser() {
++      if (!detached) {
++        env->CallVoidMethod(parcel, close);
++        if (env->ExceptionCheck()) env->ExceptionClear();
++      }
++    }
++  } closer{env, parcel, close};
++  const int descriptor = env->CallIntMethod(parcel, detach);
++  if (env->ExceptionCheck() || descriptor < 0) return fail(EIO);
++  closer.detached = true;
++  // Ownership passes to the native mapped-file wrapper, which closes the fd.
++  return descriptor;
++}
++
++}  // namespace rex::filesystem

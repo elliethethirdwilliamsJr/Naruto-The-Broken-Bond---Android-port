@@ -1,0 +1,137 @@
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -116,8 +116,8 @@
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
+-// Apple libc++ does not expose clock_time_conversion or clock_cast.
++#if defined(__APPLE__) || (REX_PLATFORM_ANDROID && __cpp_lib_chrono < 201907L)
++// The supported Apple/Android libc++ lacks these C++20 clock conversions.
+ template <class, class>
+ struct clock_time_conversion {};
+ 
+--- a/include/rex/string/numeric.h
++++ b/include/rex/string/numeric.h
+@@ -26,7 +26,7 @@
+ #include <rex/string/utf8.h>
+ #include <rex/vec128.h>
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+ #include <locale.h>
+ #endif
+ 
+@@ -114,14 +114,14 @@
+   return result;
+ }
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+ template <typename T>
+ inline std::from_chars_result portable_float_from_chars(const char* first, const char* last,
+                                                         T& value) {
+   static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>);
+ 
+-  // AppleClang's libc++ does not provide floating-point std::from_chars on all
+-  // supported SDK versions. Match from_chars semantics with a C-locale parser:
++  // The supported Apple and Android libc++ versions do not all provide floating-
++  // point std::from_chars. Match its semantics with a C-locale parser:
+   // no leading whitespace or '+', no global locale dependency, and distinct
+   // invalid-input and range errors.
+   if (first == last || *first == '+' || *first == ' ' || *first == '\f' || *first == '\n' ||
+@@ -189,7 +189,7 @@
+     }
+     std::memcpy(&result, &pun, sizeof(PUN));
+   } else {
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+     auto [p, error] = portable_float_from_chars(range.data(), range.data() + range.size(), result);
+ #else
+     auto [p, error] = std::from_chars(range.data(), range.data() + range.size(), result,
+@@ -316,7 +316,7 @@
+         assert_always();
+         return vec128_t();
+       }
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+       auto result = detail::portable_float_from_chars(p, end, v.f32[i]);
+ #else
+       auto result = std::from_chars(p, end, v.f32[i], std::chars_format::general);
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -51,6 +51,7 @@
+ #endif
+ 
+ #if REX_PLATFORM_ANDROID
++#include <android/api-level.h>
+ #include <string.h>
+ 
+ #include <dlfcn.h>
+@@ -58,8 +59,6 @@
+ 
+ #include <linux/ashmem.h>
+ 
+-// TODO(tomc): Android or maybe na. idk
+-// #include "xenia/base/main_android.h"
+ #endif
+ 
+ namespace rex {
+@@ -96,7 +95,7 @@
+ static int (*android_ASharedMemory_create_)(const char* name, size_t size);
+ 
+ void AndroidInitialize() {
+-  if (rex::GetAndroidApiLevel() >= 26) {
++  if (android_get_device_api_level() >= 26) {
+     libandroid_ = dlopen("libandroid.so", RTLD_NOW);
+     assert_not_null(libandroid_);
+     if (libandroid_) {
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -43,9 +43,9 @@
+ #include <sched.h>
+ 
+ #if REX_PLATFORM_ANDROID
++#include <android/api-level.h>
+ #include <dlfcn.h>
+ 
+-#include <rex/main_android.h>
+ #include <rex/string.h>
+ #endif
+ 
+@@ -71,7 +71,7 @@
+ static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf, size_t n);
+ 
+ void AndroidInitialize() {
+-  if (rex::GetAndroidApiLevel() >= 26) {
++  if (android_get_device_api_level() >= 26) {
+     android_libc_ = dlopen("libc.so", RTLD_NOW);
+     assert_not_null(android_libc_);
+     if (android_libc_) {
+@@ -270,7 +270,7 @@
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_GNU_LINUX
+     // Use robust mutexes so waits can recover if owner thread terminates.
+     pthread_mutexattr_t attr;
+     if (pthread_mutexattr_init(&attr) == 0) {
+@@ -290,7 +290,7 @@
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+     bool executed;
+     auto predicate = [this] { return this->signaled(); };
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_GNU_LINUX
+     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+     int lock_result = pthread_mutex_lock(native_mutex);
+     if (lock_result == EOWNERDEAD) {
+@@ -344,7 +344,7 @@
+       locks.reserve(handles.size());
+ 
+       for (size_t i = 0; i < handles.size(); ++i) {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_GNU_LINUX
+         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+         int result = pthread_mutex_trylock(native_mutex);
+         if (result == 0 || result == EOWNERDEAD) {

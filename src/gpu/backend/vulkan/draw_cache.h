@@ -4,6 +4,7 @@
 // textures and the samplers are in the draw heap instead (backend.cpp).
 #pragma once
 #include "gpu/backend/vulkan/graphics.h"
+#include "gpu/backend/vulkan/bounded_descriptors.h"
 #include <unordered_map>
 
 namespace gpu::vulkan {
@@ -45,12 +46,14 @@ inline bool SamplerKey(const VkSamplerCreateInfo& info, std::array<uint64_t, 21>
 }
 class DrawCache {
  public:
-  DrawCache(VkDevice device, DrawCacheCounters& counters) : device_(device), counters_(counters) {}
+  DrawCache(VkDevice device, DrawCacheCounters& counters) : descriptors(device), device_(device), counters_(counters) {}
+  BoundedDescriptorPool descriptors;
   DrawCache(const DrawCache&) = delete;
   DrawCache& operator=(const DrawCache&) = delete;
   ~DrawCache() { Recycle(); }
   // Called only after the batch's GPU fence completes.
   void Recycle() {
+    descriptors.Recycle();
     for (const auto& [key, framebuffer] : framebuffers_) vkDestroyFramebuffer(device_, framebuffer, nullptr);
     for (const auto& [key, view] : views_) vkDestroyImageView(device_, view, nullptr);
     framebuffers_.clear(); views_.clear();

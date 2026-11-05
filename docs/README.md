@@ -1,5 +1,16 @@
 # Documentation
 
+## Android development checkpoint
+
+- [Android port progress](android-port-progress.md)
+- [Android developer build notes](android-build.md)
+- [Android validation](android-validation.md)
+- [Physical-device screenshots](screenshots/README.md)
+
+The guides below originate from the desktop project. Their release and performance claims do not describe this Android checkpoint.
+
+## Upstream desktop documentation
+
 - [Build and run](build-and-run.md) (Windows, and [Linux](build-and-run.md#linux))
 - [Configuration](configuration.md)
 - [Data folder](data-folder.md)

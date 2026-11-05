@@ -13,6 +13,7 @@
 #include "gpu/diagnostics/profile.h"
 #include "gpu/diagnostics/diagnostics.h"
 #include "gpu/common/guest_memory.h"
+#include "gpu/common/shader_activity.h"
 #include <bit>
 #include <algorithm>
 #include <cmath>
@@ -464,6 +465,7 @@ class DeviceOwner final {
     // This includes FIFO translation and CPU pipeline compilation before
     // submission. The backend separately bounds actual GPU completion.
     auto deadline = std::chrono::steady_clock::now() + kGateTimeout;
+    auto compiled = shader_last_finished.load(std::memory_order_relaxed);
     for (;;) {
       if (!Word(10908, counter) || !GuestWord(writeback_, completed)) return FenceResult::Failed;
       if (drained) {
@@ -479,7 +481,14 @@ class DeviceOwner final {
       if (released_ || failed()) return FenceResult::Failed;
       const uint64_t published = frame_publications_;
       fence_cv_.wait_for(lock, std::chrono::milliseconds(5));
-      if (frame_publications_ != published) deadline = std::chrono::steady_clock::now() + kGateTimeout;
+      const auto compilation_progress = shader_last_finished.load(std::memory_order_relaxed);
+      // A cold mobile driver can spend longer than one gate interval compiling
+      // the FIFO's pipelines. Completed compilations are real CPU progress;
+      // they do not publish a guest fence. GPU completion keeps its own bound.
+      if (frame_publications_ != published || compilation_progress != compiled) {
+        compiled = compilation_progress;
+        deadline = std::chrono::steady_clock::now() + kGateTimeout;
+      }
       else if (std::chrono::steady_clock::now() > deadline) return FenceResult::Failed;
     }
     record("waited");

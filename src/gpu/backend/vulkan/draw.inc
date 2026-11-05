@@ -1,7 +1,7 @@
 // Included after Backend::State, inside gpu::vulkan.
 namespace {
 uint64_t VulkanPipelineKey(const ShaderRef& vs, const ShaderRef& ps, uint64_t layout_id,
-                           const std::array<uint32_t, 21>& state) {
+                           const std::array<uint32_t, 21>& state, Topology topology) {
   const uint64_t logical = PipelineKey(vs.key, ps.key, layout_id, state);
   const uint32_t spec[]{vs.spec_mask, vs.spec_value & vs.spec_mask,
                          ps.spec_mask, ps.spec_value & ps.spec_mask};
@@ -10,9 +10,17 @@ uint64_t VulkanPipelineKey(const ShaderRef& vs, const ShaderRef& ps, uint64_t la
     hash ^= (value >> (8 * i)) & 255;
     hash *= 0x100000001B3ull;
   }
+  if (topology == Topology::kTriangleStrip) {
+    // Keep existing list keys; separate a strip from the schema-1 triangle class.
+    constexpr uint32_t marker = 0x53545250;
+    for (unsigned i = 0; i < 4; ++i) {
+      hash ^= (marker >> (8 * i)) & 255;
+      hash *= 0x100000001B3ull;
+    }
+  }
   return hash;
 }
-uint64_t VulkanPipelineKey(const PipelineDesc& d) { return VulkanPipelineKey(d.vs, d.ps, d.layout_id, d.state); }
+uint64_t VulkanPipelineKey(const PipelineDesc& d) { return VulkanPipelineKey(d.vs, d.ps, d.layout_id, d.state, d.topology); }
 ShaderRef PassShader(const char* name, ShaderStage stage) {
   std::string error;
   const auto* package = EmbeddedShaderPackage(ShaderFormat::kSpirv, error);
@@ -41,22 +49,31 @@ bool Backend::State::EnsureGraphics(std::string& evidence) {
   VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dynamic};
   vkGetPhysicalDeviceFeatures2(vulkan->physicalDevice, &features);
   custom_border = border.customBorderColors && border.customBorderColorWithoutFormat;
-  if (!dynamic.extendedDynamicState || !vkCmdBindVertexBuffers2EXT || !vkCmdSetPrimitiveTopologyEXT)
+  if (!dynamic.extendedDynamicState || !vkCmdBindVertexBuffers2EXT)
     return GraphicsError(evidence, "native-vulkan-extended-dynamic-state-required", VK_ERROR_FEATURE_NOT_PRESENT);
   // The draw heap's bindings. Plume enables every descriptor indexing feature
   // the device supports (capabilities.descriptorIndexing).
   VkPhysicalDeviceDescriptorIndexingProperties limits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES};
   VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &limits};
   vkGetPhysicalDeviceProperties2(vulkan->physicalDevice, &properties);
+  bounded_descriptors = false;
+  for (const auto& binding : contract.bindings)
+    if (binding.layout == "draw" && binding.type == "image2D<float>[64]") bounded_descriptors = true;
+  const auto& core_limits = properties.properties.limits;
+  if (bounded_descriptors && (!features.features.shaderSampledImageArrayDynamicIndexing ||
+      core_limits.maxPerStageDescriptorSampledImages < 192 || core_limits.maxPerStageDescriptorSamplers < 64 ||
+      core_limits.maxPerStageResources < 256 || core_limits.maxDescriptorSetSampledImages < 192 ||
+      core_limits.maxDescriptorSetSamplers < 64 || core_limits.maxBoundDescriptorSets < 4))
+    return GraphicsError(evidence, "native-vulkan-bounded-descriptor-limits", VK_ERROR_FEATURE_NOT_PRESENT);
   constexpr uint32_t kHeapImages = 2 * kHeapViewSlots + 1;
-  if (!vulkan->capabilities.descriptorIndexing || !indexing.descriptorBindingPartiallyBound ||
+  if (!bounded_descriptors && (!vulkan->capabilities.descriptorIndexing || !indexing.descriptorBindingPartiallyBound ||
       !indexing.descriptorBindingSampledImageUpdateAfterBind || !indexing.descriptorBindingUpdateUnusedWhilePending ||
       limits.maxPerStageDescriptorUpdateAfterBindSampledImages < kHeapImages ||
       limits.maxDescriptorSetUpdateAfterBindSampledImages < kHeapImages ||
       limits.maxPerStageDescriptorUpdateAfterBindSamplers < kHeapSamplerSlots ||
       limits.maxDescriptorSetUpdateAfterBindSamplers < kHeapSamplerSlots ||
       limits.maxPerStageUpdateAfterBindResources < kHeapImages + kHeapSamplerSlots ||
-      limits.maxUpdateAfterBindDescriptorsInAllPools < kHeapImages + kHeapSamplerSlots)
+      limits.maxUpdateAfterBindDescriptorsInAllPools < kHeapImages + kHeapSamplerSlots))
     return GraphicsError(evidence, "native-vulkan-descriptor-heap-unsupported", VK_ERROR_FEATURE_NOT_PRESENT);
   // The compiler's exported semantic locations, from the same embedded manifest
   // whose capabilities were checked at Initialize. No second location table.
@@ -80,7 +97,8 @@ bool Backend::State::EnsureGraphics(std::string& evidence) {
     ReleaseGraphics(); return GraphicsError(evidence, "native-vulkan-draw-layout", result);
   }
   pipeline_set.Configure([this](const PipelineDesc& d, PipelineSet::Pipeline& out) {
-    return MakeGraphicsPipeline(vulkan->vk, draw_layout, d, vertex_locations, out);
+    return MakeGraphicsPipeline(vulkan->vk, draw_layout, d, vertex_locations, out,
+                                VK_FORMAT_UNDEFINED, false, pipeline_compiler.get());
   });
   return true;
 }
@@ -88,6 +106,10 @@ bool Backend::State::EnsureGraphics(std::string& evidence) {
 // The draw heap (Backend::State): its set layouts, its pool and sets, and slot 0.
 bool Backend::State::CreateHeap(std::string& evidence) {
   VkResult result = VK_SUCCESS;
+  if (bounded_descriptors) {
+    result = CreateBoundedLayouts(vulkan->vk, draw_sets);
+    if (result != VK_SUCCESS) return GraphicsError(evidence, "native-vulkan-bounded-set-layout", result);
+  } else {
   // Sets 0 to 2: the 2D, 3D and cube images (the 2D and cube sets share the
   // image slots; no texture of the title is 3D); set 3: the samplers.
   constexpr uint32_t counts[]{kHeapViewSlots, 1, kHeapViewSlots, kHeapSamplerSlots};
@@ -116,10 +138,11 @@ bool Backend::State::CreateHeap(std::string& evidence) {
   allocate.descriptorPool = heap_pool; allocate.descriptorSetCount = 4; allocate.pSetLayouts = draw_sets.data();
   if ((result = vkAllocateDescriptorSets(vulkan->vk, &allocate, heap_sets.data())) != VK_SUCCESS)
     return GraphicsError(evidence, "native-vulkan-heap-sets", result);
+  }
   // Slot 0: null descriptors, or zero RGBA texels (cleared by the first draw)
   // on devices without robustness2. Separate dimensions make every statically
   // used descriptor type valid.
-  null_descriptors = vulkan->nullDescriptorSupported;
+  null_descriptors = !bounded_descriptors && vulkan->nullDescriptorSupported;
 #if defined(NATIVE_RENDERER_ENGINE_FAULT_TEST)
   if (const char* force = std::getenv("REX_NATIVE_TEST_NULL_FALLBACK"); force && std::string_view(force) == "1")
     null_descriptors = false;
@@ -147,6 +170,7 @@ bool Backend::State::CreateHeap(std::string& evidence) {
 }
 
 void Backend::State::WriteHeap(uint32_t set, uint32_t slot, VkImageView view, VkSampler sampler) {
+  if (bounded_descriptors) return;  // Each draw writes its own immutable descriptor snapshot.
   const VkDescriptorImageInfo image{sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
   VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
   write.dstSet = heap_sets[set]; write.dstArrayElement = slot; write.descriptorCount = 1;
@@ -192,6 +216,7 @@ VkResult Backend::State::HeapSampler(const VkSamplerCreateInfo& info, uint32_t& 
   if (result != VK_SUCCESS) return result;
   slot = uint32_t(heap_samplers.size());
   heap_samplers.emplace(key, std::make_pair(sampler, slot));
+  sampler_handles.push_back(sampler);
   WriteHeap(3, slot, VK_NULL_HANDLE, sampler);
   return VK_SUCCESS;
 }
@@ -235,15 +260,15 @@ void Backend::PrefetchPipelines(const std::vector<DrawRequest>& requests) {
     const uint64_t layout_id = r.layout_id ? r.layout_id : ElementsId(*r.elements);
     std::array<uint32_t, 21> words{};
     if (!DrawStateWords(r, samples, has_depth, has_color, words)) continue;
-    const uint64_t key = VulkanPipelineKey(r.vs, r.ps, layout_id, words);
+    const uint64_t key = VulkanPipelineKey(r.vs, r.ps, layout_id, words, r.topology);
     s.prefetched_keys[i] = {key, samples, has_depth, has_color};
     // As PostPipeline keys it, with the samples of the render mode; a pipeline
     // the backend holds needs no copy of its description nor a post.
     auto keyed = words;
     keyed[8] = s.PipelineSamples(keyed[8]);
-    const uint64_t posted = keyed == words ? key : VulkanPipelineKey(r.vs, r.ps, layout_id, keyed);
+    const uint64_t posted = keyed == words ? key : VulkanPipelineKey(r.vs, r.ps, layout_id, keyed, r.topology);
     if (auto it = s.pipelines.find(posted); it != s.pipelines.end() && it->second) continue;
-    PostPipeline(PipelineDesc{r.vs, r.ps, r.elements, layout_id, words});
+    PostPipeline(PipelineDesc{r.vs, r.ps, r.elements, layout_id, words, r.topology});
   }
 }
 std::vector<PipelineDesc> Backend::PipelineDescs() {
@@ -325,14 +350,14 @@ bool Backend::DrawIndexed(const DrawRequest& r, uint64_t& fence, std::string& ev
   const bool keyed = prefetched && prefetched->key && prefetched->samples == target.desc.samples &&
                      prefetched->depth == (depth != nullptr) && prefetched->color == (color != nullptr);
   if (!keyed && !words()) return fail("native-draw-topology-uncovered");
-  const uint64_t key = keyed ? prefetched->key : VulkanPipelineKey(r.vs, r.ps, layout_id, state_words);
+  const uint64_t key = keyed ? prefetched->key : VulkanPipelineKey(r.vs, r.ps, layout_id, state_words, r.topology);
   auto& pipeline = s.pipelines[key];
   const bool created = !pipeline;
   bool skip_draw = false;  // The pipeline is being created asynchronously (skip take).
   if (!pipeline) {
     if (keyed && !words()) { s.pipelines.erase(key); return fail("native-draw-topology-uncovered"); }
     // The description is copied only for a pipeline the backend lacks.
-    const PipelineDesc desc{r.vs, r.ps, r.elements, layout_id, state_words};
+    const PipelineDesc desc{r.vs, r.ps, r.elements, layout_id, state_words, r.topology};
     const uint64_t triple = TripleKey(r.vs.key, r.ps.key, layout_id);
     // The skip take (skip_pipeline_draws) posts a pipeline not ready and
     // leaves the draw out of its frame: its constants and uploads below are
@@ -355,7 +380,8 @@ bool Backend::DrawIndexed(const DrawRequest& r, uint64_t& fence, std::string& ev
       s.pipeline_origins[key] = take.origin ? take.origin : "created";
       if (!pipeline) {
         const auto begin = std::chrono::steady_clock::now();
-        const auto result = MakeGraphicsPipeline(s.vulkan->vk, s.draw_layout, desc, s.vertex_locations, pipeline);
+        const auto result = MakeGraphicsPipeline(s.vulkan->vk, s.draw_layout, desc, s.vertex_locations, pipeline,
+                                                VK_FORMAT_UNDEFINED, false, s.pipeline_compiler.get());
         if (!result.ok) { s.pipelines.erase(key); return fail(result.reason, VkResult(result.code)); }
         const auto micros = uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
         s.pipeline_create_us[key] = micros;
@@ -411,6 +437,13 @@ bool Backend::DrawIndexed(const DrawRequest& r, uint64_t& fence, std::string& ev
   const auto& scale = s.render_mode.scale;
   const float inverse[]{1.0f / scale.x, 1.0f / scale.y};
   std::memcpy(shared.data() + 280, inverse, 8);
+  BoundedImages bounded_images{};
+  BoundedSamplers bounded_samplers{};
+  std::array<VkDescriptorSet, 4> bounded_sets{};
+  if (s.bounded_descriptors) {
+    for (unsigned dimension = 0; dimension < 3; ++dimension) bounded_images[dimension].fill(s.fallback_views[dimension]);
+    bounded_samplers.fill(s.sampler_handles.at(0));
+  }
   for (const auto& t : r.textures) {
     if (t.reg >= 20) return fail("native-draw-texture-register");
     VkImage image{}; VkFormat format{}; uint32_t levels = 1;
@@ -433,7 +466,11 @@ bool Backend::DrawIndexed(const DrawRequest& r, uint64_t& fence, std::string& ev
       views = &texture.views;
     }
     uint32_t slot = 0;
-    if ((result = s.HeapView(*views, image, format, levels, t.cube, t.component_mapping, slot)) != VK_SUCCESS)
+    VkImageView bounded_view{};
+    result = s.bounded_descriptors ?
+        resources.View(image, format, VK_IMAGE_ASPECT_COLOR_BIT, levels, t.cube, t.component_mapping, bounded_view) :
+        s.HeapView(*views, image, format, levels, t.cube, t.component_mapping, slot);
+    if (result != VK_SUCCESS)
       return fail(result == VK_ERROR_TOO_MANY_OBJECTS ? "native-vulkan-heap-views-exhausted" :
                   "native-vulkan-sampled-view", result);
     VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -468,8 +505,17 @@ bool Backend::DrawIndexed(const DrawRequest& r, uint64_t& fence, std::string& ev
                   "native-vulkan-sampler", result);
     const uint32_t image_offset = t.reg < 16 ? (t.cube ? 128 : 0) + t.reg * 4 : 288 + (t.reg - 16) * 4;
     const uint32_t sampler_offset = t.reg < 16 ? 192 + t.reg * 4 : 304 + (t.reg - 16) * 4;
-    std::memcpy(shared.data() + image_offset, &slot, 4); std::memcpy(shared.data() + sampler_offset, &sampler_slot, 4);
+    if (s.bounded_descriptors) {
+      if (!RemapBoundedRegister(shared, t.reg, t.cube)) return fail("native-draw-texture-register");
+      bounded_images[t.cube ? 2 : 0][t.reg + 1] = bounded_view;
+      bounded_samplers[t.reg + 1] = s.sampler_handles.at(sampler_slot);
+    } else {
+      std::memcpy(shared.data() + image_offset, &slot, 4); std::memcpy(shared.data() + sampler_offset, &sampler_slot, 4);
+    }
   }
+  if (s.bounded_descriptors && (result = resources.descriptors.Allocate(
+      s.draw_sets, bounded_images, bounded_samplers, bounded_sets)) != VK_SUCCESS)
+    return fail("native-vulkan-bounded-descriptor-allocation", result);
   // Each draw gets one contiguous allocation; offsets are stable even if the
   // upload page vector grows on the next draw.
   auto align = [](size_t n) { return (n + 511) & ~size_t(511); };
@@ -581,11 +627,6 @@ bool Backend::DrawIndexed(const DrawRequest& r, uint64_t& fence, std::string& ev
   if (!valid || r.stencil_ref != bound.draw_stencil) {
     vkCmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_AND_BACK, r.stencil_ref); bound.draw_stencil = r.stencil_ref;
   }
-  if (!valid || r.topology != bound.draw_topology) {
-    vkCmdSetPrimitiveTopologyEXT(commands, r.topology == Topology::kTriangleStrip ?
-        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-    bound.draw_topology = r.topology;
-  }
   if (!valid || bound.draw_stream_count != r.streams.size() || bound.draw_streams != streams ||
       bound.draw_offsets != stream_offsets || bound.draw_strides != strides) {
     vkCmdBindVertexBuffers2EXT(commands, 0, uint32_t(r.streams.size()), streams.data(), stream_offsets.data(), nullptr, strides.data());
@@ -597,8 +638,9 @@ bool Backend::DrawIndexed(const DrawRequest& r, uint64_t& fence, std::string& ev
     bound.draw_indices = indices; bound.draw_index_offset = index_offset; bound.draw_index32 = r.index32;
   }
   // The heap is bound once per pass: transfers and the passes of other layouts end it.
-  if (!valid) {
-    vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, s.draw_layout, 0, 4, s.heap_sets.data(), 0, nullptr);
+  if (!valid || s.bounded_descriptors) {
+    const auto& sets = s.bounded_descriptors ? bounded_sets : s.heap_sets;
+    vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, s.draw_layout, 0, 4, sets.data(), 0, nullptr);
     s.draw_counters.descriptor_binds.fetch_add(1, std::memory_order_relaxed);
   }
   vkCmdPushConstants(commands, s.draw_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 24, constants);

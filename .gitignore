@@ -5,6 +5,10 @@
 *.zip
 *.xex
 *.xexp
+*.apk
+*.aab
+*.keystore
+*.jks
 /Vimm's Lair.txt
 /game/
 /extracted/

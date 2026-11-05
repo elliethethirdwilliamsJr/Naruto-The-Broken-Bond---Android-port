@@ -4,6 +4,7 @@
 #include "gpu/backend/vulkan/formats.h"
 #include "gpu/backend/pipeline_set.h"
 #include "gpu/shaders/package.h"
+#include "gpu/backend/vulkan/mobile_pipeline_cache.h"
 #include <bit>
 #include <cstring>
 #include <map>
@@ -161,7 +162,7 @@ inline VkStencilOpState StencilFace(uint32_t value, uint32_t read, uint32_t writ
 }
 inline NativeResult MakeGraphicsPipeline(VkDevice device, VkPipelineLayout layout, const PipelineDesc& d,
     const std::map<std::string, uint32_t>& locations, PipelineSet::Pipeline& out,
-    VkFormat pass_color = VK_FORMAT_UNDEFINED, bool auxiliary = false) {
+    VkFormat pass_color = VK_FORMAT_UNDEFINED, bool auxiliary = false, MobilePipelineCache* compiler = nullptr) {
   const auto& w = d.state;
   if (!d.vs.Present() || d.vs.format != ShaderFormat::kSpirv ||
       (!w[17] && (!d.ps.Present() || d.ps.format != ShaderFormat::kSpirv)))
@@ -206,8 +207,10 @@ inline NativeResult MakeGraphicsPipeline(VkDevice device, VkPipelineLayout layou
   input.vertexBindingDescriptionCount = uint32_t(bindings.size()); input.pVertexBindingDescriptions = bindings.data();
   input.vertexAttributeDescriptionCount = uint32_t(attributes.size()); input.pVertexAttributeDescriptions = attributes.data();
   VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-  assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-  if (auxiliary && w[10] == 1) assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+  // Mali-G52 drops geometry-stage output with EXT dynamic topology. The
+  // Vulkan key distinguishes lists/strips while the shared key keeps its class.
+  assembly.topology = (auxiliary ? w[10] == 1 : d.topology == Topology::kTriangleStrip) ?
+      VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
   viewport.viewportCount = viewport.scissorCount = 1;
   VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -240,17 +243,33 @@ inline NativeResult MakeGraphicsPipeline(VkDevice device, VkPipelineLayout layou
   blend.attachmentCount = w[18] ? 1 : 0; blend.pAttachments = &attachment;
   const VkDynamicState states[]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
       VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-      VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY_EXT};
+      VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT};
   VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
   dynamic.dynamicStateCount = auxiliary ? 2 : uint32_t(std::size(states)); dynamic.pDynamicStates = states;
-  VkShaderModule modules[2]{};
-  VkPipelineShaderStageCreateInfo stages[2]{};
+  std::vector<uint8_t> geometry;
+  if (!auxiliary && d.vs.key.starts_with("vs-")) {
+    std::string error;
+    const auto* package = EmbeddedShaderPackage(ShaderFormat::kSpirv, error);
+    // Standalone native-pipeline tests may supply shaders without a package.
+    // A game session already requires a valid package during initialization.
+    if (package) {
+      const auto clip = package->passes.find("clip_planes_gs");
+      if (clip != package->passes.end()) {
+        geometry = DecodeShaderModule(*package, clip->second);
+        if (geometry.empty()) return NativeResult::Failed("native-vulkan-clip-module", VK_ERROR_INVALID_SHADER_NV);
+      }
+    }
+  }
+  VkShaderModule modules[3]{};
+  VkPipelineShaderStageCreateInfo stages[3]{};
   VkSpecializationMapEntry entry{0, 0, 4};
   const uint32_t values[]{d.vs.spec_value & d.vs.spec_mask, d.ps.spec_value & d.ps.spec_mask};
   VkSpecializationInfo specs[2]{{1, &entry, 4, &values[0]}, {1, &entry, 4, &values[1]}};
-  const uint32_t count = w[17] ? 1 : 2;
+  const uint32_t count = (w[17] ? 1 : 2) + !geometry.empty();
   for (uint32_t i = 0; i < count; ++i) {
-    const auto& bytes = *(i ? d.ps.bytes : d.vs.bytes);
+    const bool is_geometry = !geometry.empty() && i == 1;
+    const bool is_pixel = i != 0 && !is_geometry;
+    const auto& bytes = is_geometry ? geometry : *(is_pixel ? d.ps.bytes : d.vs.bytes);
     // std::vector's storage is aligned for uint32_t; reject malformed modules.
     if (bytes.size() % 4) { result = VK_ERROR_INVALID_SHADER_NV; break; }
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -258,16 +277,25 @@ inline NativeResult MakeGraphicsPipeline(VkDevice device, VkPipelineLayout layou
     result = vkCreateShaderModule(device, &info, nullptr, &modules[i]);
     if (result != VK_SUCCESS) break;
     stages[i] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
-    stages[i].module = modules[i]; stages[i].pName = "main"; stages[i].pSpecializationInfo = &specs[i];
+    stages[i].stage = is_geometry ? VK_SHADER_STAGE_GEOMETRY_BIT :
+                      is_pixel ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+    stages[i].module = modules[i]; stages[i].pName = "main";
+    stages[i].pSpecializationInfo = is_geometry ? nullptr : &specs[is_pixel ? 1 : 0];
   }
   if (result == VK_SUCCESS) {
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+#if defined(__ANDROID__)
+    // Opt-in development experiment for long mobile-driver compilations.
+    const char* fast_compile = std::getenv("REX_ANDROID_PIPELINE_NO_OPTIMIZE");
+    if (fast_compile && std::string_view(fast_compile) == "1")
+      info.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+#endif
     info.stageCount = count; info.pStages = stages; info.pVertexInputState = &input;
     info.pInputAssemblyState = &assembly; info.pViewportState = &viewport; info.pRasterizationState = &raster;
     info.pMultisampleState = &ms; info.pDepthStencilState = &ds; info.pColorBlendState = &blend;
     info.pDynamicState = &dynamic; info.layout = layout; info.renderPass = pipeline->pass;
-    result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline->pipeline);
+    result = compiler ? compiler->Create(info, &pipeline->pipeline) :
+        vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline->pipeline);
   }
   for (auto module : modules) if (module) vkDestroyShaderModule(device, module, nullptr);
   if (result != VK_SUCCESS) return NativeResult::Failed("native-vulkan-graphics-pipeline", result);

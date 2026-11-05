@@ -19,7 +19,9 @@
 #include "gpu/backend/regions.h"
 #include "gpu/backend/vulkan/completion.h"
 #include "gpu/backend/vulkan/formats.h"
+#include "gpu/textures/upload_fallback.h"
 #include "gpu/backend/vulkan/shader_contract.h"
+#include "gpu/backend/vulkan/surface_format.h"
 #include "gpu/backend/vulkan/graphics.h"
 #include "gpu/backend/vulkan/draw_cache.h"
 #include "gpu/backend/output_plan.h"
@@ -27,7 +29,7 @@
 #include "gpu/d3d/init/initializer_services.h"
 #include "gpu/diagnostics/profile.h"
 #include "gpu/shaders/package.h"
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 // Wayland's WSI: not in Plume's headers, which build for Xlib on Linux.
 #include <vulkan/vulkan_wayland.h>
 #endif
@@ -422,7 +424,6 @@ struct Backend::State {
     VkRect2D draw_scissor{};
     std::array<float, 4> draw_blend{};
     uint32_t draw_stencil = 0;
-    Topology draw_topology = Topology::kTriangleList;
     std::array<VkBuffer, 8> draw_streams{};
     std::array<VkDeviceSize, 8> draw_offsets{}, draw_strides{};
     uint32_t draw_stream_count = 0;
@@ -524,6 +525,7 @@ struct Backend::State {
   // Sampled copies of guest texture memory, keyed by the caller.
   struct Sampled {
     std::shared_ptr<VmaImage> image;
+    TextureFormat source_format = TextureFormat::kUnknown;
     TextureFormat format = TextureFormat::kUnknown;
     uint32_t width = 0, height = 0, levels = 0;
     uint64_t layout = 0, version = 0;
@@ -533,6 +535,7 @@ struct Backend::State {
     HeapViews views;  // Once sampled; destroyed before the image.
   };
   std::unordered_map<uint32_t, Sampled> sampled;
+  std::unordered_map<TextureFormat, TextureFormat> sampled_formats;
   std::vector<Sampled> retired_sampled;
   uint64_t sampled_released = 0, sampled_retired = 0;
   // Vertex and index buffers of the draw layer (UploadBuffer), keyed by the
@@ -552,6 +555,7 @@ struct Backend::State {
   std::vector<uint32_t> free_views;
   uint64_t operations = 0;
   PipelineSet pipeline_set;  // Shared scheduling policy; configured by EnsureGraphics.
+  std::unique_ptr<MobilePipelineCache> pipeline_compiler;
   VkPipelineLayout draw_layout = VK_NULL_HANDLE, resolve_layout = VK_NULL_HANDLE;
   std::array<VkDescriptorSetLayout, 4> draw_sets{};
   VkDescriptorSetLayout resolve_set = VK_NULL_HANDLE;
@@ -563,8 +567,10 @@ struct Backend::State {
   // device without them, and the point sampler. Sampler slots live for the session.
   VkDescriptorPool heap_pool = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, 4> heap_sets{};
+  bool bounded_descriptors = false;
   bool null_descriptors = false;
   std::unordered_map<std::array<uint64_t, 21>, std::pair<VkSampler, uint32_t>, DrawKeyHash<21>> heap_samplers;
+  std::vector<VkSampler> sampler_handles;
   bool CreateHeap(std::string& evidence);
   // A free image slot, or 0 once every slot is taken.
   uint32_t AllocateSlot() {
@@ -606,6 +612,15 @@ struct Backend::State {
   VkSurfaceKHR window_surface{};
   VkSwapchainKHR swapchain{};
   VkExtent2D swap_extent{};
+  VkSurfaceTransformFlagBitsKHR swap_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  VkSurfaceTransformFlagBitsKHR surface_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  bool RecreateForSuboptimal() const {
+    // Android reports this while its compositor rotates our unrotated image.
+    // Rebuilding with the same deliberate transform cannot improve it. Actual
+    // size changes and OUT_OF_DATE / SURFACE_LOST still renew the surface.
+    return window.kind != platform::NativeWindow::Kind::kAndroid || swap_transform == surface_transform;
+  }
+  VkFormat swap_format = VK_FORMAT_B8G8R8A8_UNORM;
   VkPresentModeKHR swap_mode = VK_PRESENT_MODE_FIFO_KHR;
   bool recreate_swapchain = false;
   bool surface_lost = false;  // A present found the surface lost: recreated at the next frame.
@@ -691,6 +706,7 @@ struct Backend::State {
     fallback_views = {}; fallback_images = {}; fallback_initialized = false;
     for (const auto& [key, sampler] : heap_samplers) vkDestroySampler(vulkan->vk, sampler.first, nullptr);
     heap_samplers.clear();
+    sampler_handles.clear();
     if (heap_pool) vkDestroyDescriptorPool(vulkan->vk, heap_pool, nullptr);  // Frees its sets.
     heap_pool = VK_NULL_HANDLE; heap_sets = {};
     pipelines.clear(); resolve_pipelines.clear(); pipeline_descs.clear(); pipeline_order.clear();
@@ -1099,9 +1115,20 @@ bool Backend::Initialize(std::string& evidence, const RenderMode& mode) {
                VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT, "D32_SFLOAT_S8_UINT");
   format_needs(VK_FORMAT_R32_SFLOAT, kCopy | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
                VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT, "R32_SFLOAT");
-  for (TextureFormat format : kTextureFormats)
-    format_needs(ImageFormat(format), kCopy | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
-                 fmt::format("texture-{}", uint32_t(format)).c_str());
+  VkPhysicalDeviceFeatures physical_features{};
+  vkGetPhysicalDeviceFeatures(physical, &physical_features);
+  auto sampled_supported = [&](TextureFormat format) {
+    if (IsBlockCompressed(format) && !physical_features.textureCompressionBC) return false;
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(physical, ImageFormat(format), &properties);
+    constexpr auto needed = kCopy | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    return (properties.optimalTilingFeatures & needed) == needed;
+  };
+  for (TextureFormat format : kTextureFormats) {
+    const auto selected = SelectSampledFormat(format, sampled_supported);
+    if (selected == TextureFormat::kUnknown) missing.push_back(fmt::format("format:texture-{}", uint32_t(format)));
+    else state_->sampled_formats[format] = selected;
+  }
   // The SPIR-V contract of the build (its manifest's) against the device.
   std::string contract_error;
   const ShaderPackage* package = EmbeddedShaderPackage(ShaderFormat::kSpirv, contract_error);
@@ -1157,6 +1184,10 @@ bool Backend::Initialize(std::string& evidence, const RenderMode& mode) {
   state_->owner_thread = rex::thread::current_thread_system_id();
   state_->ready = true;
   const auto& p = vulkan->physicalDeviceProperties;
+#if defined(__ANDROID__)
+  if (const char* path = std::getenv("REX_ANDROID_PIPELINE_CACHE"); path && *path)
+    state_->pipeline_compiler = std::make_unique<MobilePipelineCache>(vulkan->vk, p, path);
+#endif
   std::string requested;
   if (!mode.device.empty())
     requested = fmt::format(",\"device_requested\":\"{}\",\"device_matched\":{}", JsonText(mode.device),
@@ -1178,6 +1209,8 @@ bool Backend::Initialize(std::string& evidence, const RenderMode& mode) {
       mode.scale.Unit() && !mode.msaa_samples ? std::string() : fmt::format(
           ",\"render_mode\":{{\"scale\":[{},{}],\"msaa_samples\":{},\"msaa_requested\":{}}}", mode.scale.x,
           mode.scale.y, state_->render_mode.msaa_samples, mode.msaa_samples), requested);
+  if (state_->pipeline_compiler)
+    evidence.insert(evidence.size() - 1, ",\"pipeline_cache\":" + state_->pipeline_compiler->Summary());
   return true;
 }
 
@@ -1249,6 +1282,7 @@ bool Backend::Shutdown(std::string& evidence) {
   state_->hold = VK_NULL_HANDLE;
 #endif
   state_->queue.reset();
+  state_->pipeline_compiler.reset();  // Save and destroy its cache before the Vulkan device.
   state_->device.reset();
   state_->vulkan = nullptr;
   state_->render.reset();
@@ -1796,27 +1830,38 @@ bool Backend::UploadSampled(const DrawTexture& t, std::string& evidence) {
   const uint32_t subresources = t.levels * (t.cube ? 6 : 1);
   if (t.resolved || !t.width || !t.height || !t.levels || t.levels > 13 || t.width > 8192 || t.height > 8192 ||
       t.data.size() != subresources) return fail("native-upload-texture-description");
-  const VkFormat format = ImageFormat(t.format);
+  const auto selected = state_->sampled_formats.find(t.format);
+  if (selected == state_->sampled_formats.end()) return fail("native-upload-texture-format", VK_ERROR_FORMAT_NOT_SUPPORTED);
+  const TextureFormat host_format = selected->second;
+  const VkFormat format = ImageFormat(host_format);
   if (format == VK_FORMAT_UNDEFINED) return fail("native-upload-texture-create", VK_ERROR_FORMAT_NOT_SUPPORTED);
   // Subresource i is level i % levels of face i / levels, its rows packed.
-  VkDeviceSize bytes = 0;
-  std::vector<VkDeviceSize> offsets(subresources);
   for (uint32_t i = 0; i < subresources; ++i) {
     const LevelRows rows = RowsOfLevel(t.format, t.width, t.height, i % t.levels);
     if (t.data[i].size() != size_t(rows.rows) * rows.row_bytes) return fail("native-upload-texture-data-size");
-    offsets[i] = bytes;
-    bytes += (VkDeviceSize(t.data[i].size()) + 15) & ~VkDeviceSize(15);  // A block of any format.
   }
   VkResult result = VK_SUCCESS;
   const char* batch_reason = nullptr;
   if (!state_->OpenBatch(batch_reason, result)) return fail(batch_reason, result);
   auto& s = state_->sampled[t.key];
-  const bool recreate = !s.image || s.layout != t.layout || s.format != t.format || s.width != t.width ||
+  const bool recreate = !s.image || s.layout != t.layout || s.source_format != t.format ||
+                        s.format != host_format || s.width != t.width ||
                         s.height != t.height || s.levels != t.levels || s.cube != t.cube;
   if (!recreate && s.version >= t.version) {
     evidence = fmt::format("{{\"uploaded\":false,\"skipped\":true,\"key\":{},\"version\":{},\"copy_version\":{}}}",
                            t.key, t.version, s.version);
     return true;
+  }
+  std::vector<std::vector<uint8_t>> decoded;
+  std::string decode_reason;
+  if (host_format != t.format && !DecodeSampledData(t, host_format, decoded, decode_reason))
+    return fail(decode_reason.c_str());
+  const auto& data = host_format == t.format ? t.data : decoded;
+  VkDeviceSize bytes = 0;
+  std::vector<VkDeviceSize> offsets(subresources);
+  for (uint32_t i = 0; i < subresources; ++i) {
+    offsets[i] = bytes;
+    bytes += (VkDeviceSize(data[i].size()) + 15) & ~VkDeviceSize(15);
   }
   if (recreate) {
     // An image the submitted or recorded work may still read stays with the
@@ -1837,7 +1882,8 @@ bool Backend::UploadSampled(const DrawTexture& t, std::string& evidence) {
       return fail("native-upload-texture-create", result);
     }
     s.state = {};
-    s.format = t.format;
+    s.source_format = t.format;
+    s.format = host_format;
     s.width = t.width;
     s.height = t.height;
     s.levels = t.levels;
@@ -1851,7 +1897,7 @@ bool Backend::UploadSampled(const DrawTexture& t, std::string& evidence) {
   if (!state_->Upload(bytes, page, page_offset, result)) return fail("native-upload-buffer", result);
   std::vector<VkBufferImageCopy> regions(subresources);
   for (uint32_t i = 0; i < subresources; ++i) {
-    std::memcpy(page->buffer->mapped + page_offset + offsets[i], t.data[i].data(), t.data[i].size());
+    std::memcpy(page->buffer->mapped + page_offset + offsets[i], data[i].data(), data[i].size());
     const uint32_t level = i % t.levels;
     regions[i].bufferOffset = page_offset + offsets[i];
     regions[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, i / t.levels, 1};
@@ -1870,7 +1916,9 @@ bool Backend::UploadSampled(const DrawTexture& t, std::string& evidence) {
   if (batch_operations >= kBatchOperationsMax && !state_->CloseBatch(batch_reason, result))
     return fail(batch_reason, result);
   evidence = fmt::format("{{\"uploaded\":true,\"key\":{},\"recreated\":{},\"version\":{},\"bytes\":{},"
-                         "\"sampled_copies\":{}}}", t.key, recreate, t.version, bytes, state_->sampled.size());
+                         "\"sampled_copies\":{},\"source_format\":{},\"host_format\":{},\"cpu_decoded\":{}}}",
+                         t.key, recreate, t.version, bytes, state_->sampled.size(), uint32_t(t.format),
+                         uint32_t(host_format), host_format != t.format);
   return true;
 }
 

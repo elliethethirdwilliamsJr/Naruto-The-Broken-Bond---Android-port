@@ -3,7 +3,7 @@
 // same table as the backend.
 #pragma once
 
-#include <plume_vulkan.h>  // Vulkan through volk, with the platform defines of Plume.
+#include <vulkan/vulkan_core.h>  // Core format values; independent of window-system headers.
 #include "gpu/backend/contracts.h"
 
 namespace gpu::vulkan {

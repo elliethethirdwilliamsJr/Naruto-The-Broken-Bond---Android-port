@@ -45,13 +45,24 @@ for r in variants['results']:
 for r in spirv['results']:
     shaders[r['name']]['spirv'] = r['spirv_sha256']
 summary = spirv['summary']
+geometry_clip = summary['stage_interface'].get('clip_mode', 'native') == 'geometry'
+if geometry_clip != any(r['name'] == 'clip_planes_gs' for r in passes['results']):
+    sys.exit('build-shader-manifest: vertex clip interface and geometry pass disagree')
+if geometry_clip and any(v.get('interpolation') for r in spirv['results'] if r['stage'] == 'ps'
+                         for v in r['interface']['inputs']):
+    sys.exit('build-shader-manifest: geometry clipping requires the audited smooth pixel inputs')
 both = lambda field: sorted(set(summary[field]) | set(passes['summary'][field]))
+required_capabilities = both('capabilities')
+if summary['layout'].get('descriptor_mode') == 'bounded':
+    # DXC need not emit this SPIR-V capability for dynamically uniform accesses,
+    # but the Vulkan core feature is still part of our explicit runtime policy.
+    required_capabilities = sorted(set(required_capabilities) | {'SampledImageArrayDynamicIndexing'})
 INTERFACE = ('capabilities', 'bindings', 'push_constant_offset', 'push_constant_bytes')
 contract = dict(
     target_environment=summary['target_environment'], spirv_versions=both('spirv_versions'),
     arguments=spirv['arguments'], validator=dict(arguments=spirv['arguments']['spirv_val'],
                                                  sha256=spirv['tools']['spirv_val']),
-    required=dict(capabilities=both('capabilities'), extensions=both('extensions')),
+    required=dict(capabilities=required_capabilities, extensions=both('extensions')),
     layout=summary['layout'],
     used_bindings=[dict(set=s, binding=b, type=t) for s, b, t in summary['bindings']],
     stage_interface=summary['stage_interface'], vertex_input_locations=summary['vertex_input_locations'],

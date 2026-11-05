@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <string_view>
+#include <cstdio>
 #include <fmt/format.h>
 #include "gpu/common/title_loading.h"
 #include <rex/thread.h>
@@ -29,6 +30,19 @@ void StoreMax(std::atomic<uint64_t>& max, uint64_t value) {
 uint64_t ElapsedUs(std::chrono::steady_clock::time_point since) {
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - since).count());
 }
+void TraceCompilation(uint64_t job, const PipelineDesc& desc, const char* phase, uint64_t elapsed_us = 0) {
+  const char* path = std::getenv("REX_NATIVE_PIPELINE_TRACE");
+  if (!path || !*path) return;
+  static std::mutex mutex;
+  const std::string row = fmt::format(
+      "{{\"job\":{},\"phase\":\"{}\",\"vs\":\"{}\",\"ps\":\"{}\",\"layout\":{},\"elapsed_us\":{}}}\n",
+      job, phase, desc.vs.key, desc.ps.key, desc.layout_id, elapsed_us);
+  std::lock_guard lock(mutex);
+  if (auto* out = std::fopen(path, "ab")) {
+    std::fwrite(row.data(), 1, row.size(), out);
+    std::fclose(out);
+  }
+}
 }  // namespace
 
 PipelineSet::PipelineSet() : warm_sync_(warmSyncOption()) {}
@@ -38,7 +52,13 @@ PipelineSet::~PipelineSet() { Stop(); }
 void PipelineSet::Configure(Creator creator) {
   creator_ = [creator = std::move(creator)](const PipelineDesc& desc, Pipeline& pipeline) {
     ShaderCompilation activity;
-    return creator(desc, pipeline);
+    static std::atomic<uint64_t> next_job{0};
+    const auto job = next_job.fetch_add(1);
+    const auto started = std::chrono::steady_clock::now();
+    TraceCompilation(job, desc, "begin");
+    const auto result = creator(desc, pipeline);
+    TraceCompilation(job, desc, result.ok ? "ready" : "failed", ElapsedUs(started));
+    return result;
   };
 }
 

@@ -327,6 +327,9 @@ struct PipelineDesc {
   VertexElements elements;
   uint64_t layout_id = 0;
   std::array<uint32_t, 21> state{};
+  // Vulkan bakes the exact topology; the shared schema-1 state still records
+  // its triangle class. Reloaded class-only warm lists default to a list.
+  Topology topology = Topology::kTriangleList;
 };
 
 // How the swapchain presents (gpu/settings.h). With VSync the Present

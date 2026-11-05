@@ -1,0 +1,21 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.brokenbond.nativecheck" android:versionCode="8" android:versionName="0.4.0">
+    <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="35" />
+    <uses-feature android:glEsVersion="0x00030000" android:required="false" />
+    <application android:label="Broken Bond Test" android:theme="@android:style/Theme.Material.NoActionBar"
+        android:debuggable="true" android:extractNativeLibs="true" android:allowBackup="false"
+        android:supportsRtl="true" android:icon="@android:drawable/ic_menu_info_details">
+        <activity android:name=".GameActivity" android:exported="false" android:process=":game"
+            android:launchMode="singleTop"
+            android:screenOrientation="landscape"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|navigation|density" />
+        <activity android:name=".RendererActivity" android:exported="false" />
+        <activity android:name=".MainActivity" android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

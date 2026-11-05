@@ -92,7 +92,7 @@ function(brokenbond_shader_cache target source)
       message(FATAL_ERROR "brokenbond_shader_cache: SPIRV needs PASSES <backend folder>")
     endif()
     get_filename_component(passes "${arg_PASSES}" ABSOLUTE)
-    file(GLOB pass_sources CONFIGURE_DEPENDS "${passes}/*.hlsl" "${passes}/fxaa/*"
+    file(GLOB pass_sources CONFIGURE_DEPENDS "${passes}/*.hlsl" "${passes}/*.hlsli" "${passes}/fxaa/*"
          "${passes}/sdk_shaders/vulkan_spirv/*.h")
     find_program(BROKENBOND_SPIRV_VAL spirv-val
         HINTS "$ENV{VULKAN_SDK}/Bin"
@@ -109,8 +109,19 @@ function(brokenbond_shader_cache target source)
     target_link_libraries(${target}_smolv_encode PRIVATE ${target}_smolv)
     target_link_libraries(${target} PRIVATE ${target}_smolv)
     target_compile_definitions(${target} PRIVATE BROKENBOND_SHADER_CACHE_SPIRV=1)
+    set(BROKENBOND_VULKAN_CLIP_MODE "native" CACHE STRING "Vulkan user clipping: native or geometry")
+    set_property(CACHE BROKENBOND_VULKAN_CLIP_MODE PROPERTY STRINGS native geometry)
+    set(BROKENBOND_VULKAN_DESCRIPTOR_MODE "runtime" CACHE STRING "Vulkan descriptors: runtime or bounded")
+    set_property(CACHE BROKENBOND_VULKAN_DESCRIPTOR_MODE PROPERTY STRINGS runtime bounded)
+    if(NOT BROKENBOND_VULKAN_DESCRIPTOR_MODE MATCHES "^(runtime|bounded)$")
+      message(FATAL_ERROR "BROKENBOND_VULKAN_DESCRIPTOR_MODE must be runtime or bounded")
+    endif()
+    if(NOT BROKENBOND_VULKAN_CLIP_MODE MATCHES "^(native|geometry)$")
+      message(FATAL_ERROR "BROKENBOND_VULKAN_CLIP_MODE must be native or geometry")
+    endif()
     set(spirv --spirv-val "${BROKENBOND_SPIRV_VAL}" --smolv-encode "$<TARGET_FILE:${target}_smolv_encode>"
-              --passes "${passes}")
+              --passes "${passes}" --vulkan-clip-mode "${BROKENBOND_VULKAN_CLIP_MODE}"
+              --vulkan-descriptor-mode "${BROKENBOND_VULKAN_DESCRIPTOR_MODE}")
     set(spirv_outputs "${out}/shader_cache_spirv.bin" "${out}/shader_manifest.json")
     set(spirv_encoder ${target}_smolv_encode)  # Reruns the chain when the encoder changes.
   endif()
@@ -139,7 +150,7 @@ function(brokenbond_shader_cache target source)
       INSTALL_COMMAND ""
       BUILD_BYPRODUCTS "${recomp}")
 
-  set(scripts build-shader-cache.py extract-sdb-containers.py build-sdb-shader-cache.py
+  set(scripts mobile_descriptors.py mobile_clip.py build-shader-cache.py extract-sdb-containers.py build-sdb-shader-cache.py
       build-sdb-shader-libraries.py build-sdb-shader-variants.py build-native-shader-index.py
       build-embedded-shader-cache.py shader_store.py build-sdb-shader-spirv.py spirv_module.py
       build-shader-manifest.py build-pass-spirv.py)
